@@ -3,7 +3,7 @@ package suggest
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	lipgloss "github.com/startvibecoding/agentui/style"
 )
 
 // Item represents a single autocomplete suggestion.

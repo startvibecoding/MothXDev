@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	xansi "github.com/charmbracelet/x/ansi"
+	tea "github.com/startvibecoding/agentui"
+	xansi "github.com/startvibecoding/agentui/ansi"
+	lipgloss "github.com/startvibecoding/agentui/style"
 	"github.com/startvibecoding/mothx/internal/config"
 	"github.com/startvibecoding/mothx/internal/platform"
 	"github.com/startvibecoding/mothx/internal/session"

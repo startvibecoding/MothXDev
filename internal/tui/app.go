@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/bubbles/stopwatch"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/startvibecoding/GoStreamingMarkdown/gsm"
+	tea "github.com/startvibecoding/agentui"
+	lipgloss "github.com/startvibecoding/agentui/style"
+	stopwatch "github.com/startvibecoding/agentui/timer"
 
 	agentpkg "github.com/startvibecoding/mothx/agent"
 	"github.com/startvibecoding/mothx/internal/agent"

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "github.com/startvibecoding/agentui"
+	lipgloss "github.com/startvibecoding/agentui/style"
 
 	"github.com/startvibecoding/mothx/internal/config"
 	providerfactory "github.com/startvibecoding/mothx/internal/provider/factory"

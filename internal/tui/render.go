@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-	xansi "github.com/charmbracelet/x/ansi"
+	xansi "github.com/startvibecoding/agentui/ansi"
+	lipgloss "github.com/startvibecoding/agentui/style"
 
 	"github.com/startvibecoding/mothx/internal/tui/renderutil"
 )

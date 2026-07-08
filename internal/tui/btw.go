@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/startvibecoding/GoStreamingMarkdown/gsm"
+	tea "github.com/startvibecoding/agentui"
+	lipgloss "github.com/startvibecoding/agentui/style"
 
 	agentpkg "github.com/startvibecoding/mothx/agent"
 	"github.com/startvibecoding/mothx/internal/agent"

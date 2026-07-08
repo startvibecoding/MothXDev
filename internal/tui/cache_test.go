@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "github.com/startvibecoding/agentui"
+	lipgloss "github.com/startvibecoding/agentui/style"
 	"github.com/startvibecoding/mothx/internal/agent"
 	"github.com/startvibecoding/mothx/internal/config"
 	ctxpkg "github.com/startvibecoding/mothx/internal/context"

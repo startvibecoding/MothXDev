@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "github.com/startvibecoding/agentui"
+	lipgloss "github.com/startvibecoding/agentui/style"
 
 	"github.com/startvibecoding/mothx/internal/stats"
 )

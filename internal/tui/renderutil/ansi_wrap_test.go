@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	xansi "github.com/charmbracelet/x/ansi"
+	xansi "github.com/startvibecoding/agentui/ansi"
 )
 
 var sgrRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)

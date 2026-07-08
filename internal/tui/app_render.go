@@ -3,8 +3,8 @@ package tui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/startvibecoding/GoStreamingMarkdown/gsm"
+	lipgloss "github.com/startvibecoding/agentui/style"
 	"github.com/startvibecoding/mothx/internal/tui/renderutil"
 )
 

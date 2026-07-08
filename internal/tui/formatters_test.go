@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/lipgloss"
+	lipgloss "github.com/startvibecoding/agentui/style"
 )
 
 func TestTruncateDisplayWidth(t *testing.T) {

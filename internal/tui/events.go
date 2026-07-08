@@ -3,7 +3,7 @@ package tui
 import (
 	"context"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "github.com/startvibecoding/agentui"
 
 	"github.com/startvibecoding/mothx/internal/agent"
 )

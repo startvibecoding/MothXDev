@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "github.com/startvibecoding/agentui"
 )
 
 func TestNewModel(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"unicode"
 
-	xansi "github.com/charmbracelet/x/ansi"
+	xansi "github.com/startvibecoding/agentui/ansi"
 )
 
 // buffer is a Unicode-aware multi-line text buffer.

@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	tea "github.com/startvibecoding/agentui"
 
 	"github.com/startvibecoding/mothx/internal/a2a"
 	"github.com/startvibecoding/mothx/internal/acp"

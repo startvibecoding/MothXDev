@@ -3,7 +3,7 @@ package renderutil
 import (
 	"strings"
 
-	xansi "github.com/charmbracelet/x/ansi"
+	xansi "github.com/startvibecoding/agentui/ansi"
 )
 
 const pathBreakpoints = "/"

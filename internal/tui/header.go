@@ -3,7 +3,7 @@ package tui
 import (
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	lipgloss "github.com/startvibecoding/agentui/style"
 )
 
 const mothxLogo = `██   ██  ███  ████ █  █ █  █

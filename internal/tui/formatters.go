@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	lipgloss "github.com/startvibecoding/agentui/style"
 
 	"github.com/startvibecoding/mothx/internal/tools"
 )
