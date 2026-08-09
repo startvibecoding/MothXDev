@@ -1,9 +1,8 @@
 <script>
   import { onDestroy, onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
-  import { markdownToHTML, highlightedCodeToHTML } from '../lib/markdown.js';
   import { readSSE, postJSON } from '../lib/api.js';
-  import { approvalSessionID, approvalRequestOwnership, approvalHistoryFromRunEvents, applyApprovalRequestToRuntime } from '../lib/approval.js';
+  import { approvalSessionID, approvalHistoryFromRunEvents, createApprovalManager } from '../lib/approval.js';
   import {
     sessions,
     capabilities,
@@ -18,7 +17,6 @@
     refreshSessions,
     refreshStatsSummary,
     resetSelectedModelToDefault,
-    getSessionMessages,
     getSessionMessagesLatest,
     getSessionMessagesBefore,
     getSessionToolResult,
@@ -40,33 +38,15 @@
     setSessionTools,
     moveSessionTools
   } from '../lib/stores.js';
-  import { shortID, formatArgs } from '../lib/format.js';
   import {
-    buildToolCallView,
     normalizeSessionMessage,
-    upsertMessageInList,
     viewFromSessionState,
     sessionStateWithView,
-    reduceTranscriptEvent,
-    reduceToolStatusEvent,
     reduceRunEvent,
-    reduceCapabilityEvent,
-    reduceRuntimeSnapshot,
-    reduceStreamDone,
     reduceStreamError,
-    reduceApprovalRequest,
     reduceApprovalResolved,
     supportsAttachmentDownload,
-    maxSeq,
-    textFromContents,
-    toolResultKind,
-    parseReadResult,
-    parseLsResult,
-    parseGrepResult,
-    parseBashResult,
-    parseBrowserResult,
-    parseSubAgentResult,
-    parseWorkflowLintResult
+    maxSeq
   } from '../lib/session-view.js';
   import {
     sessionRunStates,
@@ -81,31 +61,51 @@
     abortCompletion,
     registerObserver,
     clearObserver,
-    stopObserver,
-    eventBelongsToSession
+    stopObserver
   } from '../lib/session-runs.js';
+  import Composer from '../components/chat/Composer.svelte';
+  import ChatTranscript from '../components/chat/ChatTranscript.svelte';
+  import ApprovalCenter from '../components/chat/ApprovalCenter.svelte';
+  import SubAgentModal from '../components/chat/SubAgentModal.svelte';
   import DirBrowser from '../components/DirBrowser.svelte';
   import MCPConfigEditor from '../components/MCPConfigEditor.svelte';
   import { t } from '../lib/preferences.js';
+  import {
+    safeAttachmentURL,
+    formatCompactTokens,
+    formatCacheRate,
+    isCronRun,
+    cronRunName,
+    formatEventTime,
+    normalizeToolResultDetail,
+    buildSessionEventSummary,
+    buildSubAgentSummary
+  } from '../lib/chat-helpers.js';
+  import {
+    buildSessionRunPayload,
+    createResponsesRunPoller,
+    createSessionRunManager
+  } from '../lib/chat-runtime.js';
+  import { createSessionRuntimeManager } from '../lib/chat-runtime-state.js';
+  import { createSessionStreamManager } from '../lib/chat-session-stream.js';
+  import { createSubAgentManager } from '../lib/chat-subagents.js';
+  import {
+    createSessionHistoryManager,
+    createSessionSwitchManager,
+    persistSessionView,
+    restoreSessionView
+  } from '../lib/chat-session-state.js';
 
   let prompt = '';
   let availableSkills = [];
   let activeSkills = [];
   let showSkillPicker = false;
   let showToolMenu = false;
-  let toolMenuBtn;
   let loadedSkillsKey = '';
   let messages = [];
-  let earliestSeq = null;
-  let hasMoreHistory = false;
   let loadingHistory = false;
-  // Scroll-top auto-load gating: only user scrolls that enter the top zone
-  // after the initial scroll-to-bottom may trigger history loading.
-  // Programmatic scroll resets (refresh, session switch, content replacement
-  // after a run) must not trigger it — one spurious event would cascade into
-  // loading the entire history.
-  let historyAutoLoadReady = false;
-  let lastChatScrollTop = -1;
+  // Scroll-top auto-load gating is managed by chat-session-state.js so only
+  // user scrolls that enter the top zone after initial positioning load history.
   let busy = false;
   let chatEvents = [];
   let sessionRunEvents = [];
@@ -113,7 +113,6 @@
   let workDir = '';
   let sessionCreated = false;
   let showBrowser = false;
-  let imageInput;
   let imageUploads = [];
   let chatScroll;
   let shouldFollowOutput = true;
@@ -134,15 +133,12 @@
   let subAgentModalMessages = [];
   let subAgentModalLoading = false;
   let subAgentModalError = '';
-  let subAgentRefreshTimer = 0;
   let sessionRuntimeValue = null;
   let newSessionMode = 'yolo';
   let runtimeUpdating = false;
   let approvalHistory = [];
   let runEventCursor = 0;
-  let runtimeControls;
-  let modelPicker;
-  let skillPicker;
+  let composer;
   let showRuntimePanel = false;
   let showModelPicker = false;
   let showApprovalCenter = false;
@@ -150,8 +146,13 @@
   let selectedApprovalID = '';
   let approvalSubmitting = false;
   let stopSubmitting = false;
-  let responsesRunPollTimer = 0;
-  let responsesRunReconnectKey = '';
+  let runtimePoller;
+  let runtimeManager;
+  let sessionHistoryManager;
+  let sessionSwitchManager;
+  let sessionStreamManager;
+  let subAgentManager;
+  let approvalManager;
   $: activeSession = ($sessions || []).find((item) => item?.id === $currentSession);
   $: channelBadge = activeSession?.channelLabel || $t('sessions.local');
 
@@ -178,22 +179,6 @@
     { key: 'workflows', label: 'workflow' }
   ];
 
-  function safeAttachmentURL(value) {
-    try {
-      const parsed = new URL(String(value || ''));
-      if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return '';
-      const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
-      if (!host || host === 'localhost' || host.endsWith('.localhost')) return '';
-      if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return '';
-      const octets = host.match(/^172\.(\d{1,3})\./);
-      if (octets && Number(octets[1]) >= 16 && Number(octets[1]) <= 31) return '';
-      if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return '';
-      return parsed.href;
-    } catch {
-      return '';
-    }
-  }
-
   function attachmentDownloadURL(attachment) {
     if (!attachment || attachment.kind !== 'file' || !attachment.providerRef || !$currentSession) return '';
     if (!supportsAttachmentDownload($capabilities)) return '';
@@ -201,148 +186,51 @@
   }
 
   // Reset or load state when the selected session changes.
-  let prevSession = $currentSession;
   onMount(() => {
-    const handleRuntimeOutsidePointer = (event) => {
-      if (showRuntimePanel && runtimeControls && !runtimeControls.contains(event.target)) {
-        showRuntimePanel = false;
-      }
-      if (showModelPicker && modelPicker && !modelPicker.contains(event.target)) {
-        showModelPicker = false;
-      }
-      if (showSkillPicker && skillPicker && !skillPicker.contains(event.target)) {
-        showSkillPicker = false;
-      }
-      if (showToolMenu && toolMenuBtn && !toolMenuBtn.contains(event.target)) {
-        showToolMenu = false;
-      }
-    };
-    document.addEventListener('pointerdown', handleRuntimeOutsidePointer);
     if ($currentSession) {
       loadSessionMessages($currentSession);
     }
     loadSkills();
-    return () => document.removeEventListener('pointerdown', handleRuntimeOutsidePointer);
   });
   onDestroy(() => {
     for (const state of Object.values(get(sessionRunStates))) {
       state.observer?.controller?.abort();
       // Runs are persistent; do not abort on component destroy. completion is left intact.;
     }
-    if (subAgentRefreshTimer) clearTimeout(subAgentRefreshTimer);
-    if (responsesRunPollTimer) clearInterval(responsesRunPollTimer);
+    runtimePoller?.stop();
+    subAgentManager?.destroy();
   });
 
-  $: {
-    const nextSession = $currentSession;
-    if (nextSession !== prevSession) {
-      if (prevSession) persistLocalSessionState(prevSession);
-      if (prevSession && prevSession !== nextSession) stopObserver(prevSession);
-      if (prevSession && prevSession !== nextSession && responsesRunPollTimer) {
-        clearInterval(responsesRunPollTimer);
-        responsesRunPollTimer = 0;
-      }
-      sessionHistoryLoadedFor = '';
-      hasMoreHistory = false;
-      earliestSeq = null;
-      historyAutoLoadReady = false;
-      lastChatScrollTop = -1;
-      subAgents = [];
-      subAgentTranscripts = {};
-      closeSubAgentModal();
-      activeApproval.set(null);
-      selectedApprovalID = '';
-      if (nextSession === '') {
-        sessionCreated = false;
-        workDir = '';
-        messages = []; // new chat — no history
-        chatEvents = []; // reset tool events
-        sessionRunEvents = [];
-        sessionCapabilityEvents = [];
-        resetSelectedModelToDefault();
-        shouldFollowOutput = true;
-      } else {
-        const cached = getSessionState(nextSession);
-        if (cached.historyLoaded || isCompletionActive(cached)) {
-          try {
-            restoreLocalSessionState(cached);
-            // Restore the pagination window from cached messages so scroll-top
-            // loading keeps working after switching back to this session.
-            earliestSeq = minLoadedMessageSeq(messages);
-            hasMoreHistory = earliestSeq != null;
-            sessionCreated = true;
-            scrollChatToBottom({ force: true });
-            markHistoryAutoLoadWhenScrolled(nextSession);
-          } catch (err) {
-            console.warn("Failed to restore cached session state, loading from server:", err);
-            loadSessionMessages(nextSession);
-          }
-        } else {
-          loadSessionMessages(nextSession);
-        }
-      }
-      prevSession = nextSession;
-    }
-  }
+  $: sessionSwitchManager.select($currentSession);
 
   function persistLocalSessionState(id) {
     if (!id) return;
-    updateSessionState(id, (state) => {
-      // Skip the store write entirely when nothing changed (e.g. replayed
-      // history frames) — each write notifies every sessionRunStates subscriber.
-      if (
-        state.messages === messages &&
-        state.toolEvents === chatEvents &&
-        state.runEvents === sessionRunEvents &&
-        state.capabilityEvents === sessionCapabilityEvents &&
-        state.runtime === sessionRuntimeValue &&
-        state.cursor === sessionStreamCursor &&
-        state.streamCompleted === (sessionStreamCompletedFor === id) &&
-        state.subAgents === subAgents &&
-        state.subAgentTranscripts === subAgentTranscripts &&
-        state.hostedItems === hostedItems &&
-        state.streamUsesTranscript === streamUsesTranscript &&
-        state.optimisticRunEventID === optimisticRunEventID &&
-        (state.historyLoaded || sessionHistoryLoadedFor !== id)
-      ) {
-        return state;
-      }
-      return {
-        ...state,
-        messages,
-        toolEvents: chatEvents,
-        runEvents: sessionRunEvents,
-        capabilityEvents: sessionCapabilityEvents,
-        runtime: sessionRuntimeValue,
-        pendingApprovals: sessionRuntimeValue?.pendingApprovals || [],
-        cursor: sessionStreamCursor,
-        historyLoaded: sessionHistoryLoadedFor === id || state.historyLoaded,
-        streamCompleted: sessionStreamCompletedFor === id,
-        streamUsesTranscript,
-        optimisticRunEventID,
-        subAgents,
-        subAgentTranscripts,
-        hostedItems
-      };
-    });
+    updateSessionState(id, (state) => persistSessionView(state, id, {
+      ...currentView(),
+      streamCompleted: sessionStreamCompletedFor === id,
+      streamUsesTranscript,
+      optimisticRunEventID
+    }, sessionHistoryLoadedFor));
   }
 
   function restoreLocalSessionState(state) {
-    messages = state?.messages || [];
-    chatEvents = state?.toolEvents || [];
-    sessionRunEvents = state?.runEvents || [];
-    sessionCapabilityEvents = state?.capabilityEvents || [];
-    sessionRuntimeValue = state?.runtime || null;
-    sessionRuntime.set(sessionRuntimeValue);
-    sessionStreamCursor = state?.cursor || { entrySeq: 0, runSeq: 0, capabilitySeq: 0 };
-    sessionHistoryLoadedFor = state?.historyLoaded ? state.sessionId : '';
-    sessionStreamCompletedFor = state?.streamCompleted ? state.sessionId : '';
-    streamUsesTranscript = Boolean(state?.streamUsesTranscript);
-    optimisticRunEventID = state?.optimisticRunEventID || '';
-    subAgents = state?.subAgents || [];
-    subAgentTranscripts = state?.subAgentTranscripts || {};
-    hostedItems = state?.hostedItems || [];
+    const restored = restoreSessionView(state);
+    messages = restored.messages;
+    chatEvents = restored.toolEvents;
+    sessionRunEvents = restored.runEvents;
+    sessionCapabilityEvents = restored.capabilityEvents;
+    sessionRuntimeValue = restored.runtime;
+    sessionRuntime.set(restored.runtime);
+    sessionStreamCursor = restored.cursor;
+    sessionHistoryLoadedFor = restored.historyLoadedFor;
+    sessionStreamCompletedFor = restored.streamCompletedFor;
+    streamUsesTranscript = restored.streamUsesTranscript;
+    optimisticRunEventID = restored.optimisticRunEventID;
+    subAgents = restored.subAgents;
+    subAgentTranscripts = restored.subAgentTranscripts;
+    hostedItems = restored.hostedItems;
     approvalHistory = approvalHistoryFromRunEvents(sessionRunEvents);
+    return messages;
   }
 
   // --- Session view state ---
@@ -408,113 +296,208 @@
     return { effects };
   }
 
-  // Enable scroll-top auto-loading only after the initial scroll-to-bottom
-  // completed. The double rAF runs after scrollChatToBottom's own rAF, so
-  // scroll events fired by programmatic resets during loading are ignored.
-  function markHistoryAutoLoadWhenScrolled(id) {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (id === $currentSession) historyAutoLoadReady = true;
-      });
-    });
-  }
-
-  async function loadSessionMessages(id) {
-    historyAutoLoadReady = false;
-    try {
-      const { messages: msgs, hasMore } = await getSessionMessagesLatest(id, 50);
-      if (id !== $currentSession) return;
-      if (msgs && msgs.length > 0) {
-        messages = msgs.map((msg) => normalizeSessionMessage(msg, $t)).filter(Boolean);
-        earliestSeq = msgs.length > 0 ? msgs[0].seq : null;
-        hasMoreHistory = hasMore;
-      } else {
-        messages = [];
-        earliestSeq = null;
-        hasMoreHistory = false;
-      }
-      chatEvents = []; // reset tool events for new session view
-      await loadSessionEvents(id);
-      await loadSessionRuntime(id);
-      sessionHistoryLoadedFor = id;
-      updateSessionStreamCursorFromState();
-      persistLocalSessionState(id);
-      scrollChatToBottom({ force: true });
-      markHistoryAutoLoadWhenScrolled(id);
-    } catch {
-      if (id !== $currentSession) return;
-      // Leave messages empty on error
-      sessionHistoryLoadedFor = id;
-      updateSessionStreamCursorFromState();
-      persistLocalSessionState(id);
+  sessionHistoryManager = createSessionHistoryManager({
+    getCurrentSession: () => $currentSession,
+    getSessionState,
+    getMessages: () => messages,
+    setMessages: (next) => { messages = next; },
+    clearToolEvents: () => { chatEvents = []; },
+    loadEvents: loadSessionEvents,
+    loadRuntime: loadSessionRuntime,
+    updateCursor: updateSessionStreamCursorFromState,
+    markHistoryLoaded: (id) => { sessionHistoryLoadedFor = id; },
+    persist: persistLocalSessionState,
+    normalizeMessage: (message) => normalizeSessionMessage(message, $t),
+    getLatest: getSessionMessagesLatest,
+    getBefore: getSessionMessagesBefore,
+    scrollToBottom: scrollChatToBottom,
+    getScrollElement: () => chatScroll,
+    afterDOMUpdate: tick,
+    setSessionCreated: (created) => { sessionCreated = created; },
+    onStateChange: (state) => {
+      loadingHistory = state.loading;
     }
-    sessionCreated = true; // existing session, not "new"
-  }
+  });
 
-  function minLoadedMessageSeq(list) {
-    let min = null;
-    for (const m of list || []) {
-      const s = Number(m?.seq || 0);
-      if (s > 0 && (min == null || s < min)) min = s;
+  sessionSwitchManager = createSessionSwitchManager({
+    initialSession: $currentSession,
+    persist: persistLocalSessionState,
+    stopObserver,
+    stopRuntimePolling: () => runtimePoller?.stop(),
+    resetHistory: () => {
+      sessionHistoryLoadedFor = '';
+      sessionHistoryManager.reset();
+    },
+    resetTransientView: () => {
+      subAgents = [];
+      subAgentTranscripts = {};
+      subAgentManager.reset();
+      activeApproval.set(null);
+      selectedApprovalID = '';
+    },
+    resetNewSessionView: () => {
+      sessionCreated = false;
+      workDir = '';
+      messages = [];
+      chatEvents = [];
+      sessionRunEvents = [];
+      sessionCapabilityEvents = [];
+      resetSelectedModelToDefault();
+      shouldFollowOutput = true;
+    },
+    getSessionState,
+    isRestorable: (state) => state.historyLoaded || isCompletionActive(state),
+    restoreSession: restoreLocalSessionState,
+    restoreHistory: (restoredMessages) => sessionHistoryManager.restore(restoredMessages),
+    setSessionCreated: (created) => { sessionCreated = created; },
+    scrollToBottom: scrollChatToBottom,
+    markHistoryReady: (id) => sessionHistoryManager.markReadyWhenScrolled(id),
+    loadSession: loadSessionMessages,
+    onRestoreError: (error) => {
+      console.warn('Failed to restore cached session state, loading from server:', error);
     }
-    return min;
+  });
+
+  function loadSessionMessages(id) {
+    return sessionHistoryManager.loadSession(id);
   }
 
-  // isOlderThanLoadedHistory reports whether a replayed transcript frame is
-  // older than the session's loaded history window. Such frames belong to the
-  // paginated region and are fetched on demand via REST instead.
   function isOlderThanLoadedHistory(id, seq) {
-    if (id === $currentSession) {
-      return sessionHistoryLoadedFor === id && earliestSeq != null && seq < earliestSeq;
-    }
-    const state = getSessionState(id);
-    if (!state?.historyLoaded) return false;
-    const min = minLoadedMessageSeq(state.messages);
-    return min != null && seq < min;
+    return sessionHistoryManager.isOlderThanLoadedHistory(id, seq, sessionHistoryLoadedFor);
   }
 
-  async function loadMoreHistory() {
-    if (loadingHistory || !hasMoreHistory || earliestSeq == null) return;
-    const sessionID = $currentSession;
-    if (!sessionID) return;
-    loadingHistory = true;
-    try {
-      const { messages: older, hasMore } = await getSessionMessagesBefore(sessionID, earliestSeq, 50);
-      if (sessionID !== $currentSession) return;
-      if (older.length > 0) {
-        const beforeScrollHeight = chatScroll?.scrollHeight || 0;
-        const beforeScrollTop = chatScroll?.scrollTop || 0;
-        const normalized = older.map((msg) => normalizeSessionMessage(msg, $t)).filter(Boolean);
-        // The runs WebSocket replays persisted transcripts on subscribe and may
-        // have already merged some of these older entries into the view.
-        // Prepending them again would duplicate blocks, so skip entries whose
-        // id is already rendered.
-        const known = new Set(messages.map((m) => m.id).filter(Boolean));
-        const fresh = normalized.filter((m) => !m.id || !known.has(m.id));
-        earliestSeq = older[0].seq;
-        hasMoreHistory = hasMore;
-        if (fresh.length > 0) {
-          messages = [...fresh, ...messages];
-          // Preserve scroll position after prepending, keeping the offset the
-          // user had within the top zone when the load was triggered.
-          await tick();
-          if (chatScroll) {
-            chatScroll.scrollTop = chatScroll.scrollHeight - beforeScrollHeight + beforeScrollTop;
-            // Keep in sync so the restore itself isn't seen as a user scroll.
-            lastChatScrollTop = chatScroll.scrollTop;
-          }
-        }
-      } else {
-        hasMoreHistory = false;
-      }
-    } catch {
-      // silently fail
-    } finally {
-      loadingHistory = false;
-    }
-  }
+  runtimePoller = createResponsesRunPoller({
+    getCurrentSession: () => $currentSession,
+    getRuntime: () => sessionRuntimeValue,
+    setRuntime: (snapshot) => {
+      sessionRuntimeValue = snapshot;
+      sessionRuntime.set(snapshot);
+    },
+    persist: persistLocalSessionState,
+    reconnect: reconnectResponsesRun,
+    getRun: getResponsesRun,
+    loadRuntime: loadSessionRuntime,
+    isActive: isActiveRunStatus
+  });
 
-  $: activeSession = $sessions.find((s) => s.id === $currentSession);
+  subAgentManager = createSubAgentManager({
+    getCurrentSession: () => $currentSession,
+    getAgents: () => subAgents,
+    setAgents: (next) => { subAgents = next; },
+    getTranscripts: () => subAgentTranscripts,
+    fetchAgents: getSessionSubAgents,
+    fetchMessages: getSessionSubAgentMessages,
+    normalizeMessage: (message) => normalizeSessionMessage(message, $t),
+    onModalStateChange: (state) => {
+      showSubAgentModal = state.open;
+      selectedSubAgentID = state.selectedAgentID;
+      subAgentModalMessages = state.messages;
+      subAgentModalLoading = state.loading;
+      subAgentModalError = state.error;
+    }
+  });
+
+  runtimeManager = createSessionRuntimeManager({
+    getCurrentSession: () => $currentSession,
+    getRuntime: () => sessionRuntimeValue,
+    setRuntime: (snapshot) => {
+      sessionRuntimeValue = snapshot;
+      sessionRuntime.set(snapshot);
+    },
+    getSessionRuntime,
+    patchSessionRuntime,
+    getSessionTools: () => sessionTools,
+    setSessionTools,
+    persist: persistLocalSessionState,
+    upsertSession,
+    refreshSessions,
+    setUpdating: (updating) => { runtimeUpdating = updating; },
+    setError
+  });
+
+  sessionRunManager = createSessionRunManager({
+    getCurrentSession: () => $currentSession,
+    getSessionState,
+    getRuntime: () => sessionRuntimeValue,
+    setRuntime: (snapshot) => {
+      sessionRuntimeValue = snapshot;
+      sessionRuntime.set(snapshot);
+    },
+    persist: persistLocalSessionState,
+    applyViewReducer: applySessionViewReducer,
+    registerCompletion,
+    markCompletion,
+    clearCompletion,
+    abortCompletion,
+    updateOptimisticID: (sessionID, id) => {
+      updateSessionState(sessionID, (state) => ({ ...state, optimisticRunEventID: id }));
+      if (sessionID === $currentSession) optimisticRunEventID = id;
+    },
+    upsertSession,
+    buildSessionInfo: buildOptimisticSessionInfo,
+    refreshSessions,
+    refreshStats: refreshStatsSummary,
+    loadMessages: loadSessionMessages,
+    loadSubAgents,
+    loadRuntime: loadSessionRuntime,
+    setSessionCreated: (created) => { sessionCreated = created; },
+    getStreamHadError: (sessionID) => sessionID === $currentSession && streamHadError,
+    reduceError: (view, message) => reduceStreamError(view, message, $t),
+    setError,
+    setNotice,
+    translate: (key) => $t(key),
+    setStopSubmitting: (submitting) => { stopSubmitting = submitting; },
+    cancelResponsesRun,
+    postJSON,
+    getSessionRuntime
+  });
+
+  approvalManager = createApprovalManager({
+    getCurrentSession: () => $currentSession,
+    getRuntime: () => sessionRuntimeValue,
+    getSelectedID: () => selectedApprovalID,
+    setSelected: (id, approval) => {
+      selectedApprovalID = id;
+      activeApproval.set(approval);
+    },
+    setOpen: (open) => { showApprovalCenter = open; },
+    setSubmitting: (submitting) => { approvalSubmitting = submitting; },
+    postJSON,
+    recordResolution: recordApprovalResolution,
+    applyViewReducer: applySessionViewReducer,
+    reduceResolved: reduceApprovalResolved,
+    setError
+  });
+
+  sessionStreamManager = createSessionStreamManager({
+    readSSE,
+    getCurrentSession: () => $currentSession,
+    getSessionState,
+    getFallbackCursor: () => sessionStreamCursor,
+    registerObserver,
+    clearObserver,
+    applyReducer: applySessionViewReducer,
+    isCompletionActive,
+    isOlderThanLoadedHistory,
+    translate: (key, params) => $t(key, params),
+    setError,
+    markStreamError: () => { streamHadError = true; },
+    onDone: (id) => {
+      refreshSessions().catch(() => {});
+      loadSessionMessages(id).catch(() => {});
+      loadSubAgents(id).catch(() => {});
+      refreshStatsSummary().catch(() => {});
+    },
+    onSubAgentEffects: handleSubAgentEffects,
+    onApprovalRequest: (item) => {
+      approvalManager.request(item);
+    },
+    recordApprovalResolution,
+    onApprovalResolved: (item) => {
+      approvalManager.resolved(item);
+    }
+  });
+
   $: selectedRunState = $currentSession ? $sessionRunStates[$currentSession] : null;
   // busy reflects runs started by this page (completion) as well as runs
   // observed after a page refresh via the runtime snapshot (activeRun).
@@ -526,24 +509,15 @@
     const responseRun = sessionRuntimeValue?.responsesRun;
     if (responseRun && isActiveRunStatus(responseRun.state)) {
       startResponsesRunPolling($currentSession, responseRun.localRunId);
-    } else if (responsesRunPollTimer) {
-      clearInterval(responsesRunPollTimer);
-      responsesRunPollTimer = 0;
+    } else {
+      runtimePoller?.stop();
     }
   }
   $: runtimeMode = sessionRuntimeValue?.mode || activeSession?.mode || (!$currentSession ? newSessionMode : 'yolo');
   $: pendingApprovalCount = (sessionRuntimeValue?.pendingApprovals || []).length;
   $: {
-    const pending = sessionRuntimeValue?.pendingApprovals || [];
-    if (pending.length > 0 && !pending.some((approval) => approval.approvalId === selectedApprovalID)) {
-      selectedApprovalID = pending[0].approvalId;
-      activeApproval.set(pending[0]);
-    } else if (pending.length === 0 && selectedApprovalID) {
-      selectedApprovalID = '';
-      activeApproval.set(null);
-    }
+    approvalManager?.syncPending();
   }
-  $: approvalToolViewValue = approvalToolView(selectedApproval);
   $: selectedApproval = (sessionRuntimeValue?.pendingApprovals || []).find((approval) => approval.approvalId === selectedApprovalID) || $activeApproval || null;
   $: runtimeActiveRun = sessionRuntimeValue?.activeRun || (
     sessionRuntimeValue?.responsesRun
@@ -559,7 +533,7 @@
   $: availableToolToggles = toolToggles.filter((item) => isToolToggleVisible(item, $features));
   $: visibleSessionTools = filterHiddenSessionTools(sessionTools, $features);
   $: sessionEventSummary = buildSessionEventSummary(sessionRunEvents, sessionCapabilityEvents, activeSessionWorkDir, $selectedModel);
-  $: subAgentSummary = buildSubAgentSummary(subAgents);
+  $: subAgentSummary = buildSubAgentSummary(subAgents, $t);
   $: modelOptions = $models;
   $: activeModel = modelOptions.find((m) => m.id === $selectedModel);
   $: selectedModelSupportsImages = (activeModel?.input || []).includes('image');
@@ -597,7 +571,7 @@
         const normalizedEvent = ['started', 'finished', 'failed', 'canceled'].includes(eventName)
           ? 'run_event'
           : eventName;
-        handleSessionStreamEvent(item.sessionId, {
+        sessionStreamManager.handleEvent(item.sessionId, {
           event: normalizedEvent,
           data: JSON.stringify(item.data ?? item)
         });
@@ -622,7 +596,7 @@
       && sessionStreamCompletedFor !== tailID
     );
     if (shouldTail) {
-      startSessionStream(tailID);
+      sessionStreamManager.start(tailID);
     } else if (!shouldTail && tailID) {
       stopObserver(tailID);
     }
@@ -709,119 +683,32 @@
     scrollChatToBottom({ force: true });
     prompt = '';
     imageUploads = [];
-    if (imageInput) imageInput.value = '';
+    composer?.clearImageInput();
 
-    const controller = new AbortController();
-    registerCompletion(sessionID, controller);
-    optimisticRunEventID = beginOptimisticRunEvent(sessionID);
-    persistLocalSessionState(sessionID);
-    try {
-      // Use the new submit run API instead of /v1/chat/completions.
-      // The run is submitted to the server and events are received via WebSocket.
-      const submitBody = JSON.stringify({
-        message: outgoing,
+    const payload = buildSessionRunPayload({
+      message: outgoing,
+      model: $selectedModel,
+      mode: creatingSession ? newSessionMode : undefined,
+      tools: visibleSessionTools,
+      skills: activeSkills,
+      images: outgoingImages
+    });
+    await sessionRunManager.start({
+      sessionID,
+      payload,
+      creatingExplicitSession,
+      firstMessage: outgoing,
+      event: {
         model: $selectedModel || 'default',
-        mode: creatingSession ? newSessionMode : undefined,
-        tools: visibleSessionTools ? Object.keys(visibleSessionTools).filter(k => visibleSessionTools[k]) : [],
-        skills: activeSkills,
-        images: outgoingImages.map(img => img.dataUrl),
-        transcript: true
-      });
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionID)}/runs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: submitBody,
-        signal: controller.signal
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        let data = null;
-        try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-        throw new Error(data?.error?.message || data?.error || data?.message || `${res.status} ${res.statusText}`);
+        mode: activeSession?.mode || '',
+        workDir: creatingSession ? workDir.trim() : activeSessionWorkDir
       }
-      const submitResult = await res.json();
-      markCompletion(sessionID, 'running');
-      if (creatingExplicitSession) {
-        upsertSession(buildOptimisticSessionInfo(sessionID, outgoing, { running: true }));
-        refreshSessions().catch(() => {});
-      }
-      applySessionViewReducer(sessionID, (view) => ({
-        view: { ...view, messages: [...view.messages, { role: 'assistant', content: '' }] },
-        effects: { forceScroll: true }
-      }));
-      // Events are received via WebSocket (runEvents store) and processed
-      // by handleSessionStreamEvent. We wait for the run to complete via
-      // the sessionRunStates observer.
-      await waitForRunCompletion(sessionID, controller.signal);
-      const finalStatus = streamHadError ? 'failed' : 'completed';
-      finishOptimisticRunEvent(sessionID, finalStatus, streamHadError ? getSessionState(sessionID).lastError : '');
-      markCompletion(sessionID, finalStatus, streamHadError ? getSessionState(sessionID).lastError : '');
-      sessionCreated = true;
-    } catch (err) {
-      const canceled = err?.name === 'AbortError';
-      finishOptimisticRunEvent(sessionID, canceled ? 'canceled' : 'failed', canceled ? '' : errorMessage(err));
-      if (!canceled) applySessionViewReducer(sessionID, (view) => reduceStreamError(view, errorMessage(err), $t));
-      markCompletion(sessionID, canceled ? 'canceled' : 'failed', canceled ? '' : err);
-      if (sessionID === $currentSession) {
-        if (canceled) setNotice($t('chat.notice.stopped'));
-        else setError(err);
-      }
-    } finally {
-      clearCompletion(sessionID, controller);
-      try { await refreshSessions(); } catch {
-        // opportunistic
-      }
-      try { await refreshStatsSummary(); } catch {
-        // opportunistic
-      }
-      if (sessionID === $currentSession) {
-        try { await loadSessionMessages(sessionID); } catch {
-          // opportunistic
-        }
-        try { await loadSubAgents(sessionID); } catch {
-          // opportunistic
-        }
-      }
-      updateSessionState(sessionID, (state) => ({ ...state, optimisticRunEventID: '' }));
-      if (sessionID === $currentSession) optimisticRunEventID = '';
-    }
+    });
   }
 
   function newWebUISessionID() {
     if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
     return `webui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  }
-
-  // waitForRunCompletion polls the session state until the run completes or is aborted.
-  // This replaces the old SSE-based readSSE loop.
-  async function waitForRunCompletion(sessionID, signal) {
-    return new Promise((resolve, reject) => {
-      if (signal?.aborted) { resolve(); return; }
-      const onAbort = () => {
-        clearInterval(interval);
-        signal?.removeEventListener('abort', onAbort);
-        resolve();
-      };
-      signal?.addEventListener('abort', onAbort);
-
-      const interval = setInterval(() => {
-        if (signal?.aborted) {
-          clearInterval(interval);
-          signal?.removeEventListener('abort', onAbort);
-          resolve();
-          return;
-        }
-        const state = getSessionState(sessionID);
-        const isDone = state.streamCompleted;
-        const completionStatus = state.completion?.status;
-        if (isDone || completionStatus === 'completed' || completionStatus === 'failed' || completionStatus === 'cancel_requested') {
-          clearInterval(interval);
-          signal?.removeEventListener('abort', onAbort);
-          resolve();
-          return;
-        }
-      }, 250);
-    });
   }
 
   function buildOptimisticSessionInfo(id, firstMessage = '', overrides = {}) {
@@ -843,44 +730,7 @@
 
   async function stop() {
     if (!$currentSession || stopSubmitting) return;
-    const id = $currentSession;
-    const responseRun = sessionRuntimeValue?.responsesRun;
-    const activeRun = sessionRuntimeValue?.activeRun;
-    stopSubmitting = true;
-    markCompletion(id, 'cancel_requested');
-    if (id === $currentSession && (activeRun || responseRun)) {
-      sessionRuntimeValue = {
-        ...sessionRuntimeValue,
-        ...(activeRun
-          ? { activeRun: { ...activeRun, status: 'cancelling' } }
-          : { responsesRun: { ...responseRun, state: 'cancelling', cancelRequested: true } })
-      };
-      sessionRuntime.set(sessionRuntimeValue);
-      persistLocalSessionState(id);
-    }
-    try {
-      if (responseRun && !activeRun) {
-        await cancelResponsesRun(id, responseRun.localRunId);
-      } else {
-        await postJSON(`/api/sessions/${encodeURIComponent(id)}/stop`, {});
-      }
-      abortCompletion(id);
-      setNotice($t('chat.notice.stopped'));
-      const snapshot = await getSessionRuntime(id);
-      if (id === $currentSession) {
-        sessionRuntimeValue = snapshot;
-        sessionRuntime.set(snapshot);
-        persistLocalSessionState(id);
-      }
-    } catch (err) {
-      setError(err);
-      if (err?.message?.includes('no active run')) {
-        markCompletion(id, 'failed', err);
-        if (id === $currentSession) await loadSessionRuntime(id);
-      }
-    } finally {
-      stopSubmitting = false;
-    }
+    await sessionRunManager.stop($currentSession);
   }
 
   function resetSession() {
@@ -897,11 +747,7 @@
     // resets (refresh, session switch, message reload after a run) fire
     // scroll events too and must not start a load cascade.
     const top = chatScroll.scrollTop;
-    const enteredTopZone = top < 80 && lastChatScrollTop >= 80;
-    lastChatScrollTop = top;
-    if (historyAutoLoadReady && enteredTopZone && hasMoreHistory && !loadingHistory) {
-      loadMoreHistory();
-    }
+    sessionHistoryManager.handleScroll(top);
   }
 
   function isChatNearBottom() {
@@ -934,22 +780,11 @@
     }, $features);
     setSessionTools(sessionToolKey, nextTools);
     if (!targetSession) return;
-    try {
-      const updated = await patchSessionRuntime(
-        targetSession,
-        { capabilities: { [key]: Boolean(event.currentTarget.checked) } }
-      );
-      if (targetSession === $currentSession) {
-        sessionRuntime.set(updated);
-        sessionRuntimeValue = updated;
-        setSessionTools(targetSession, { ...nextTools, [key]: Boolean(updated?.capabilities?.[key]?.enabled) });
-        await loadSessionEvents(targetSession);
-      }
-      await refreshSessions();
-    } catch (err) {
-      setSessionTools(targetSession, previousTools);
-      setError(err);
-    }
+    const updated = await runtimeManager.updateCapability(key, Boolean(event.currentTarget.checked), {
+      filterTools: (tools) => filterHiddenSessionTools(tools, $features)
+    });
+    if (updated && targetSession === $currentSession) await loadSessionEvents(targetSession);
+    if (!updated) setSessionTools(targetSession, previousTools);
   }
 
   function isWebSearchAvailable(featureState = {}) {
@@ -1033,15 +868,8 @@
 
   function clearImages() {
     imageUploads = [];
-    if (imageInput) imageInput.value = '';
+    composer?.clearImageInput();
   }
-
-  function formatImageSize(bytes) {
-    if (!bytes) return '';
-    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  }
-
 
   function recordApprovalResolution(resolution, sessionID) {
     if (!resolution?.approvalId || !sessionID) return;
@@ -1058,146 +886,28 @@
     }));
   }
 
-  function approvalToolView(approval) {
-    const tool = approval?.tool || {};
-    return buildToolCallView(tool.name || '', tool.args || tool.details || {}, '', $t);
-  }
-
-  function approvalBashCommand(approval) {
-    const args = approval?.tool?.args || {};
-    return approval?.tool?.details?.command || args.command || args.cmd || '';
-  }
-
-  function approvalBashWorkDir(approval) {
-    return approval?.tool?.details?.workDir || approval?.context?.workDir || '';
+  function selectApproval(approvalID) {
+    approvalManager.select(approvalID);
   }
 
   async function respondApproval(approval, action) {
-    const sessionID = approvalSessionID(approval, $currentSession);
-    if (!approval?.approvalId || !sessionID || approvalSubmitting) return;
-    approvalSubmitting = true;
-    try {
-      const resolved = await postJSON(`/api/sessions/${encodeURIComponent(sessionID)}/approvals/${encodeURIComponent(approval.approvalId)}`, { action });
-      recordApprovalResolution(resolved, sessionID);
-      applySessionViewReducer(sessionID, (view) => ({ view: reduceApprovalResolved(view, resolved) }));
-      if (sessionID === $currentSession) {
-        activeApproval.set(null);
-        selectedApprovalID = '';
-        showApprovalCenter = false;
-      }
-    } catch (err) { setError(err); }
-    finally { approvalSubmitting = false; }
+    await approvalManager.respond(approval, action);
   }
 
   async function loadSessionRuntime(id) {
-    if (!id) {
-      sessionRuntime.set(null);
-      sessionRuntimeValue = null;
-      return;
-    }
-    try {
-      const snapshot = await getSessionRuntime(id);
-      if (id !== $currentSession) return;
-      sessionRuntime.set(snapshot);
-      sessionRuntimeValue = snapshot;
-      const enabledTools = Object.fromEntries(Object.entries(snapshot?.capabilities || {}).map(([key, state]) => [key, Boolean(state?.enabled)]));
-      setSessionTools(id, { ...sessionTools, ...enabledTools });
-    } catch (err) {
-      if (id === $currentSession) setError(err);
-    }
+    await runtimeManager.load(id);
   }
 
   function startResponsesRunPolling(sessionID, localRunID) {
-    if (!sessionID || !localRunID || responsesRunPollTimer) return;
-    const reconnectKey = `${sessionID}:${localRunID}`;
-    if (responsesRunReconnectKey !== reconnectKey) {
-      responsesRunReconnectKey = reconnectKey;
-      reconnectResponsesRun(sessionID, localRunID)
-        .then((result) => {
-          const run = result?.run;
-          if (sessionID !== $currentSession || !run || run.localRunId !== localRunID) return;
-          const next = { ...sessionRuntimeValue, responsesRun: {
-            ...sessionRuntimeValue?.responsesRun,
-            localRunId: run.localRunId,
-            responseId: run.responseId,
-            state: run.state,
-            cancelRequested: run.cancelRequested
-          }};
-          sessionRuntimeValue = next;
-          sessionRuntime.set(next);
-          persistLocalSessionState(sessionID);
-        })
-        .catch(() => {
-          // The polling path still reports remote state; reconnect can fail
-          // while another coordinator owns the session runtime lock.
-        });
-    }
-    const poll = async () => {
-      if (sessionID !== $currentSession) return;
-      try {
-        const run = await getResponsesRun(sessionID, localRunID);
-        if (sessionID !== $currentSession) return;
-        if (run && run.localRunId === localRunID) {
-          const next = { ...sessionRuntimeValue, responsesRun: {
-            ...sessionRuntimeValue?.responsesRun,
-            localRunId: run.localRunId,
-            responseId: run.responseId,
-            state: run.state,
-            cancelRequested: run.cancelRequested
-          }};
-          sessionRuntimeValue = next;
-          sessionRuntime.set(next);
-          persistLocalSessionState(sessionID);
-        }
-        if (!run || !isActiveRunStatus(run.state)) {
-          clearInterval(responsesRunPollTimer);
-          responsesRunPollTimer = 0;
-          await loadSessionRuntime(sessionID);
-        }
-      } catch {
-        // Keep the last durable state visible; the next interval retries.
-      }
-    };
-    poll();
-    responsesRunPollTimer = setInterval(poll, 1000);
+    runtimePoller?.start(sessionID, localRunID);
   }
 
   async function updateRuntime(patch) {
-    const id = $currentSession;
-    if (!id || runtimeUpdating) return;
-    const previous = sessionRuntimeValue;
-    runtimeUpdating = true;
-    try {
-      const snapshot = await patchSessionRuntime(id, patch);
-      if (id === $currentSession) {
-        sessionRuntime.set(snapshot);
-        sessionRuntimeValue = snapshot;
-        const enabledTools = Object.fromEntries(Object.entries(snapshot?.capabilities || {}).map(([key, state]) => [key, Boolean(state?.enabled)]));
-        setSessionTools(id, { ...sessionTools, ...enabledTools });
-        persistLocalSessionState(id);
-      }
-      // The runtime PATCH response is the authoritative state. Do not keep
-      // the mode controls disabled while the independent session-list refresh
-      // waits for first-start initialization endpoints.
-      upsertSession({ id, mode: snapshot?.mode });
-      void refreshSessions().catch((refreshErr) => {
-        console.warn('Failed to refresh sessions after runtime update:', refreshErr);
-      });
-    } catch (err) {
-      sessionRuntime.set(previous);
-      sessionRuntimeValue = previous;
-      setError(err);
-    } finally {
-      runtimeUpdating = false;
-    }
+    return runtimeManager.update(patch);
   }
 
   async function setMode(mode) {
-    if (!$currentSession) {
-      newSessionMode = mode;
-      return;
-    }
-    await updateRuntime({ mode });
+    return runtimeManager.setMode(mode, (nextMode) => { newSessionMode = nextMode; });
   }
 
   async function loadSessionEvents(id) {
@@ -1224,150 +934,20 @@
     }
   }
 
-  async function loadSubAgents(id) {
-    if (!id) {
-      subAgents = [];
-      return;
-    }
-    const agents = await getSessionSubAgents(id);
-    if (id !== $currentSession) return;
-    subAgents = mergeSubAgents(subAgents, agents || []);
-    if (showSubAgentModal) {
-      if (!selectedSubAgentID && subAgents.length > 0) {
-        selectedSubAgentID = subAgents[0].id;
-      }
-      if (selectedSubAgentID) {
-        await loadSubAgentMessages(selectedSubAgentID);
-      }
-    }
-  }
-
-  function scheduleSubAgentRefresh(delay = 250) {
-    if (!$currentSession) return;
-    if (subAgentRefreshTimer) clearTimeout(subAgentRefreshTimer);
-    const targetSession = $currentSession;
-    subAgentRefreshTimer = setTimeout(() => {
-      subAgentRefreshTimer = 0;
-      if (targetSession === $currentSession) {
-        loadSubAgents(targetSession).catch(() => {});
-      }
-    }, delay);
-  }
-
-  function mergeSubAgents(existing = [], incoming = []) {
-    const byID = new Map();
-    for (const item of existing) {
-      if (item?.id) byID.set(item.id, item);
-    }
-    for (const item of incoming) {
-      if (!item?.id) continue;
-      byID.set(item.id, { ...byID.get(item.id), ...item });
-    }
-    return Array.from(byID.values()).sort((a, b) => {
-      const left = Date.parse(a.startedAt || a.updatedAt || '') || 0;
-      const right = Date.parse(b.startedAt || b.updatedAt || '') || 0;
-      if (left !== right) return left - right;
-      return String(a.id).localeCompare(String(b.id));
-    });
-  }
-
-  async function loadSubAgentMessages(agentID) {
-    if (!$currentSession || !agentID) {
-      subAgentModalMessages = [];
-      return;
-    }
-    subAgentModalLoading = true;
-    subAgentModalError = '';
-    try {
-      const msgs = await getSessionSubAgentMessages($currentSession, agentID);
-      if (agentID !== selectedSubAgentID) return;
-      const normalized = (msgs || []).map((msg) => normalizeSessionMessage(msg, $t)).filter(Boolean);
-      const live = subAgentTranscripts[agentID] || [];
-      subAgentModalMessages = mergeMessageLists(normalized, live);
-    } catch (err) {
-      subAgentModalError = err instanceof Error ? err.message : String(err || '');
-      subAgentModalMessages = subAgentTranscripts[agentID] || [];
-    } finally {
-      subAgentModalLoading = false;
-    }
-  }
-
-  function mergeMessageLists(base = [], live = []) {
-    let out = [...base];
-    for (const item of live) {
-      out = upsertMessageInList(out, item);
-    }
-    return out;
+  function loadSubAgents(id) {
+    return subAgentManager.loadAgents(id);
   }
 
   function openSubAgentModal(agentID = '') {
-    selectedSubAgentID = agentID || selectedSubAgentID || subAgents[0]?.id || '';
-    showSubAgentModal = true;
-    if ($currentSession) {
-      loadSubAgents($currentSession).catch(() => {});
-    }
-    if (selectedSubAgentID) {
-      loadSubAgentMessages(selectedSubAgentID).catch(() => {});
-    }
+    subAgentManager.open(agentID);
   }
 
   function closeSubAgentModal() {
-    showSubAgentModal = false;
-    subAgentModalError = '';
+    subAgentManager.close();
   }
 
   function selectSubAgent(agentID) {
-    selectedSubAgentID = agentID;
-    subAgentModalMessages = subAgentTranscripts[agentID] || [];
-    loadSubAgentMessages(agentID).catch(() => {});
-  }
-
-  function beginOptimisticRunEvent(sessionID = $currentSession) {
-    const id = `local-run-${Date.now()}`;
-    const runID = `local_${Date.now()}`;
-    const event = {
-      id,
-      runId: runID,
-      sessionId: sessionID || '',
-      eventType: 'started',
-      source: 'webui',
-      status: 'running',
-      model: $selectedModel || 'default',
-      mode: activeSession?.mode || '',
-      timestamp: new Date().toISOString(),
-      data: {
-        workDir: isNewSession ? workDir.trim() : activeSessionWorkDir,
-        optimistic: true
-      }
-    };
-    sessionRunEvents = [...sessionRunEvents.filter((item) => item.id !== id), event];
-    return id;
-  }
-
-  function finishOptimisticRunEvent(sessionID, status, error = '') {
-    if (optimisticRunEventID && sessionID) {
-      const localID = optimisticRunEventID;
-      applySessionViewReducer(sessionID, (view) => {
-        const idx = view.runEvents.findIndex((item) => item.id === localID);
-        if (idx < 0) return { view };
-        const eventType = status === 'failed' ? 'failed' : status === 'canceled' ? 'canceled' : 'finished';
-        const runEvents = [...view.runEvents];
-        runEvents[idx] = {
-          ...runEvents[idx], eventType, status, timestamp: new Date().toISOString(),
-          data: { ...(runEvents[idx].data || {}), ...(error ? { error } : {}) }
-        };
-        return { view: { ...view, runEvents } };
-      });
-    }
-    if (sessionID) upsertSession({ id: sessionID, active: true, running: false });
-  }
-
-  function errorMessage(error) {
-    return String(error?.message || error || '').trim();
-  }
-
-  function resetSessionStreamCursor() {
-    sessionStreamCursor = { entrySeq: 0, runSeq: 0, capabilitySeq: 0 };
+    subAgentManager.select(agentID);
   }
 
   function updateSessionStreamCursorFromState() {
@@ -1378,233 +958,10 @@
     };
   }
 
-  function startSessionStream(id) {
-    if (!id) return;
-    const state = getSessionState(id);
-    if (state.observer?.controller) return;
-    const cursor = { ...(state.cursor || sessionStreamCursor) };
-    const abort = new AbortController();
-    registerObserver(id, abort);
-    consumeSessionStream(id, cursor, abort).finally(() => {
-      clearObserver(id, abort);
-    });
-  }
-
-  async function consumeSessionStream(id, cursor, abort) {
-    const params = new URLSearchParams();
-    if (cursor.entrySeq > 0) params.set('after_entry_seq', String(cursor.entrySeq));
-    if (cursor.runSeq > 0) params.set('after_run_seq', String(cursor.runSeq));
-    if (cursor.capabilitySeq > 0) params.set('after_capability_seq', String(cursor.capabilitySeq));
-    const query = params.toString();
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/stream${query ? `?${query}` : ''}`, {
-        signal: abort.signal
-      });
-      if (!res.ok || !res.body) {
-        const text = await res.text();
-        let data = null;
-        try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-        throw new Error(data?.error?.message || data?.error || data?.message || `${res.status} ${res.statusText}`);
-      }
-      await readSSE(res.body, (event) => handleSessionStreamEvent(id, event));
-    } catch (err) {
-      if (err?.name !== 'AbortError') {
-        setError(err);
-      }
-    }
-  }
-
-  function handleSessionStreamEvent(id, event) {
-    if (!id || event.data === '[DONE]') return;
-    const visible = id === $currentSession;
-
-    if (event.event === 'status') {
-      try {
-        const item = JSON.parse(event.data);
-        if (item?.message) {
-          const entry = { id: `stream-status-${Date.now()}`, sessionId: id, eventType: 'status', status: 'running', timestamp: new Date().toISOString(), data: { message: item.message } };
-          applySessionViewReducer(id, (view) => ({ view: reduceRunEvent(view, entry) }));
-        }
-      } catch {}
-      return;
-    }
-    if (event.event === 'done') {
-      applySessionViewReducer(id, (view) => ({ view: reduceStreamDone(view) }));
-      if (visible) {
-        refreshSessions().catch(() => {});
-        loadSessionMessages(id).catch(() => {});
-        loadSubAgents(id).catch(() => {});
-        refreshStatsSummary().catch(() => {});
-      }
-      return;
-    }
-    if (event.event === 'heartbeat') return;
-    if (event.event === 'error') {
-      // Only flag the local run as failed when this session owns the active
-      // completion; background sessions must not poison another run's status.
-      if (visible && isCompletionActive(getSessionState(id))) streamHadError = true;
-      let message = event.data;
-      try {
-        const item = JSON.parse(event.data);
-        if (item?.error) message = item.error;
-      } catch {}
-      applySessionViewReducer(id, (view) => reduceStreamError(view, message, $t));
-      if (visible) setError(message);
-      return;
-    }
-    if (event.event === 'transcript') {
-      try {
-        const item = JSON.parse(event.data);
-        if (!eventBelongsToSession(id, item)) return;
-        // History pagination loads older messages on demand via REST. Replayed
-        // transcript frames older than the loaded window would insert ahead of
-        // the paginated region (out of chronological order), so drop them once
-        // history has been loaded. Frames within/after the window still merge
-        // (dedupe by id), keeping live updates and refresh recovery working.
-        const seq = Number(item?.message?.seq || 0);
-        if (seq > 0 && isOlderThanLoadedHistory(id, seq)) return;
-        const { effects } = applySessionViewReducer(id, (view) => reduceTranscriptEvent(view, item, $t), { scroll: true });
-        if (visible) handleSubAgentEffects(effects);
-      } catch {
-        // ignore malformed transcript frames
-      }
-      return;
-    }
-    if (event.event === 'run_event' || ['started', 'finished', 'failed', 'canceled'].includes(event.event)) {
-      try {
-        const item = JSON.parse(event.data);
-        if (!eventBelongsToSession(id, item)) return;
-        applySessionViewReducer(id, (view) => ({ view: reduceRunEvent(view, item) }));
-        if ((item.status === 'failed' || item.eventType === 'failed') && item.data?.error) {
-          if (visible && isCompletionActive(getSessionState(id))) streamHadError = true;
-          applySessionViewReducer(id, (view) => reduceStreamError(view, item.data.error, $t));
-        }
-      } catch {
-        // ignore malformed event frames
-      }
-      return;
-    }
-    if (event.event === 'runtime_event') {
-      try {
-        const snapshot = JSON.parse(event.data);
-        if (!eventBelongsToSession(id, snapshot)) return;
-        applySessionViewReducer(id, (view) => ({ view: reduceRuntimeSnapshot(view, snapshot) }));
-      } catch {
-        // ignore malformed runtime frames
-      }
-      return;
-    }
-    if (event.event === 'approval_request') {
-      try {
-        const item = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-        if (!item?.approvalId || !eventBelongsToSession(id, item)) return;
-        const { effects } = applySessionViewReducer(id, (view) => reduceApprovalRequest(view, item, id));
-        if (visible && effects.applies) {
-          activeApproval.set(item);
-          selectedApprovalID = item.approvalId;
-          showApprovalCenter = true;
-        }
-      } catch {
-        // ignore malformed approval frames
-      }
-      return;
-    }
-    if (event.event === 'approval_resolved') {
-      try {
-        const item = JSON.parse(event.data);
-        const resolvedSessionID = approvalSessionID(item, id);
-        if (resolvedSessionID) {
-          recordApprovalResolution(item, resolvedSessionID);
-          applySessionViewReducer(resolvedSessionID, (view) => ({ view: reduceApprovalResolved(view, item) }));
-        }
-        if (!visible || resolvedSessionID !== id) return;
-        if (selectedApprovalID === item.approvalId) {
-          activeApproval.set(null);
-          selectedApprovalID = '';
-        }
-      } catch {
-        // ignore malformed approval frames
-      }
-      return;
-    }
-    if (event.event === 'tool_event') {
-      try {
-        const item = JSON.parse(event.data);
-        if (!eventBelongsToSession(id, item)) return;
-        const { effects } = applySessionViewReducer(id, (view) => reduceToolStatusEvent(view, item, $t), { scroll: true });
-        if (visible) handleSubAgentEffects(effects);
-      } catch {
-        // ignore malformed tool frames
-      }
-      return;
-    }
-    if (event.event === 'capability_event') {
-      try {
-        const item = JSON.parse(event.data);
-        if (!eventBelongsToSession(id, item)) return;
-        applySessionViewReducer(id, (view) => ({ view: reduceCapabilityEvent(view, item) }));
-      } catch {
-        // ignore malformed event frames
-      }
-    }
-  }
-
   // handleSubAgentEffects applies view-only side effects reported by reducers
   // (sub-agent list refresh, open modal sync). Visible session only.
   function handleSubAgentEffects(effects = {}) {
-    if (effects.subAgentRefresh) scheduleSubAgentRefresh();
-    if (showSubAgentModal && selectedSubAgentID && effects.subAgentTranscriptAgent === selectedSubAgentID) {
-      subAgentModalMessages = subAgentTranscripts[selectedSubAgentID] || [];
-    }
-  }
-
-  function buildSessionEventSummary(runEvents = [], capabilityEvents = [], workDir = '', model = '') {
-    const runs = mergeRunEvents(runEvents);
-    const currentModel = model && model !== 'default' ? model : '';
-    const matchingRuns = runs.filter((run) => {
-      if (!run.usage) return false;
-      if (currentModel && run.model && run.model !== currentModel) return false;
-      if (workDir && run.workDir && run.workDir !== workDir) return false;
-      return true;
-    });
-    const totals = runs.reduce((acc, run) => {
-      if (!run.usage) return acc;
-      acc.promptTokens += run.usage.promptTokens;
-      acc.completionTokens += run.usage.completionTokens;
-      acc.totalTokens += run.usage.totalTokens;
-      acc.cacheReadTokens += run.usage.cacheReadTokens;
-      acc.cacheWriteTokens += run.usage.cacheWriteTokens;
-      return acc;
-    }, { promptTokens: 0, completionTokens: 0, totalTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
-    return {
-      visible: runs.length > 0 || capabilityEvents.length > 0,
-      lastRun: runs[0] || null,
-      runCount: runs.length,
-      capabilityCount: capabilityEvents.length,
-      model: currentModel || runs[0]?.model || '',
-      workDir: workDir || runs[0]?.workDir || '',
-      matchingRuns: matchingRuns.length,
-      ...totals
-    };
-  }
-
-  function buildSubAgentSummary(agents = []) {
-    const list = (agents || []).filter((item) => item?.id);
-    const running = list.filter((item) => item.status === 'running' || item.status === 'ready').length;
-    const failed = list.filter((item) => item.status === 'error' || item.status === 'failed').length;
-    const done = list.filter((item) => item.status === 'done' || item.status === 'destroyed').length;
-    return {
-      visible: list.length > 0,
-      count: list.length,
-      running,
-      failed,
-      done,
-      label: running > 0
-        ? $t('chat.subagents.running', { count: running, total: list.length })
-        : failed > 0
-          ? $t('chat.subagents.failed', { count: failed, total: list.length })
-          : $t('chat.subagents.done', { count: done || list.length, total: list.length })
-    };
+    subAgentManager.handleEffects(effects);
   }
 
   function selectModel(modelID) {
@@ -1619,79 +976,6 @@
     (modelOptions.find((model) => model.id === $selectedModel)?.name ||
       modelOptions.find((model) => model.id === $selectedModel)?.id) ||
     $t('chat.defaultModel');
-  function subAgentStateClass(agent) {
-    if (!agent) return 'done';
-    if (agent.status === 'error' || agent.status === 'failed') return 'error';
-    if (agent.status === 'running' || agent.status === 'ready') return 'running';
-    return 'done';
-  }
-
-  $: selectedSubAgent = subAgents.find((item) => item.id === selectedSubAgentID) || null;
-
-  function subAgentStatusLabel(status) {
-    if (status === 'running' || status === 'ready') return $t('common.running');
-    if (status === 'error' || status === 'failed') return $t('common.failed');
-    if (status === 'destroyed') return $t('chat.subagents.destroyed');
-    return $t('common.completed');
-  }
-
-  function mergeRunEvents(events = []) {
-    const byRun = new Map();
-    for (const event of events) {
-      const runId = event.runId || event.id || '';
-      if (!runId) continue;
-      const run = byRun.get(runId) || {
-        runId,
-        eventType: '',
-        status: '',
-        source: '',
-        data: null,
-        model: '',
-        mode: '',
-        workDir: '',
-        timestamp: '',
-        usage: null
-      };
-      const eventTime = Date.parse(event.timestamp || '') || 0;
-      const runTime = Date.parse(run.timestamp || '') || 0;
-      if (eventTime >= runTime) {
-        run.timestamp = event.timestamp || run.timestamp;
-        run.eventType = event.eventType || run.eventType;
-        run.status = event.status || run.status;
-      }
-      if (event.model) run.model = event.model;
-      if (event.mode) run.mode = event.mode;
-      if (event.source) run.source = event.source;
-      if (event.data && typeof event.data === 'object') run.data = { ...(run.data || {}), ...event.data };
-      if (event.data?.workDir) run.workDir = event.data.workDir;
-      const usage = normalizeRunUsage(event.data?.usage);
-      if (usage) run.usage = usage;
-      byRun.set(runId, run);
-    }
-    return Array.from(byRun.values())
-      .sort((a, b) => (Date.parse(b.timestamp || '') || 0) - (Date.parse(a.timestamp || '') || 0));
-  }
-
-  function normalizeRunUsage(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-    const promptTokens = readNumber(raw, ['prompt_tokens', 'promptTokens', 'inputTokens', 'input']);
-    const completionTokens = readNumber(raw, ['completion_tokens', 'completionTokens', 'outputTokens', 'output']);
-    const cacheReadTokens = readNumber(raw, ['cache_read_tokens', 'cacheReadTokens', 'cacheRead', 'cached_tokens']);
-    const cacheWriteTokens = readNumber(raw, ['cache_write_tokens', 'cacheWriteTokens', 'cacheWrite']);
-    const explicitTotal = readNumber(raw, ['total_tokens', 'totalTokens']);
-    const totalTokens = explicitTotal || promptTokens + completionTokens;
-    if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0) return null;
-    return { promptTokens, completionTokens, totalTokens, cacheReadTokens, cacheWriteTokens };
-  }
-
-  function readNumber(source, keys) {
-    for (const key of keys) {
-      const value = Number(source?.[key]);
-      if (Number.isFinite(value) && value > 0) return value;
-    }
-    return 0;
-  }
-
   function sessionRunStateClass(run) {
     if (!run) return 'done';
     if (run.status === 'failed' || run.eventType === 'failed') return 'error';
@@ -1707,42 +991,6 @@
     return $t('common.completed');
   }
 
-  function isCronRun(run) {
-    return run?.source === 'cron' || Boolean(run?.data?.cronJobId);
-  }
-
-  function cronRunName(run) {
-    return run?.data?.cronJobName || '';
-  }
-
-  function formatCompactTokens(value) {
-    const n = Number(value) || 0;
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}K`;
-    return String(n);
-  }
-
-  function formatCacheRate(summary) {
-    if (!summary || summary.promptTokens <= 0) return '--';
-    const pct = Math.min(100, Math.max(0, (summary.cacheReadTokens / summary.promptTokens) * 100));
-    return `${Math.round(pct)}%`;
-  }
-
-  function compactPath(path) {
-    if (!path) return '';
-    const normalized = String(path).replace(/\/$/, '');
-    const parts = normalized.split('/').filter(Boolean);
-    if (parts.length <= 2) return normalized || '/';
-    return `.../${parts.slice(-2).join('/')}`;
-  }
-
-  function compactWorkDir(path) {
-    if (!path) return '';
-    const parts = String(path).split('/').filter(Boolean);
-    if (parts.length === 0) return '/';
-    return parts[parts.length - 1];
-  }
-
   function sessionEventTooltip(summary) {
     if (!summary) return '';
     const parts = [];
@@ -1756,22 +1004,6 @@
     parts.push(`cache ${formatCacheRate(summary)}`);
     if (summary.lastRun?.timestamp) parts.push(formatEventTime(summary.lastRun.timestamp));
     return parts.join(' · ');
-  }
-
-  function formatEventTime(value) {
-    if (!value) return '';
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return '';
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  }
-
-  function planStatusLabel(status) {
-    switch (status) {
-      case 'done': return $t('chat.plan.done');
-      case 'running': return $t('chat.plan.running');
-      case 'failed': return $t('chat.plan.failed');
-      default: return $t('chat.plan.pending');
-    }
   }
 
   async function loadToolResultDetail(msg, event) {
@@ -1790,34 +1022,6 @@
       msg.detailLoading = false;
       messages = messages;
     }
-  }
-
-  function normalizeToolResultDetail(detail) {
-    if (!detail) return { content: '', images: [] };
-    const images = [];
-    for (const block of detail.contents || []) {
-      if (block.type !== 'image' || !block.image?.data || !block.image?.mimeType) continue;
-      images.push({
-        name: block.image.mimeType,
-        type: block.image.mimeType,
-        size: block.image.bytes || block.image.originalBytes || 0,
-        dataUrl: `data:${block.image.mimeType};base64,${block.image.data}`
-      });
-    }
-    const content = detail.content || textFromContents(detail.contents);
-    return {
-      toolName: detail.toolName || '',
-      kind: toolResultKind(detail.toolName, content),
-      content: detail.content || textFromContents(detail.contents),
-      images,
-      readLines: parseReadResult(content),
-      lsEntries: parseLsResult(content),
-      grepMatches: parseGrepResult(content),
-      bashResult: parseBashResult(content),
-      browserResult: parseBrowserResult(content),
-      subAgentResult: parseSubAgentResult(content),
-      workflowLintResult: parseWorkflowLintResult(content)
-    };
   }
 
   function codeBlockControls(node) {
@@ -1902,765 +1106,90 @@
         </div>
       </div>
     {:else}
-      <div class="transcript">
-        {#each messages as msg, idx}
-          {#if msg.role === 'user'}
-            <article class="msg user">
-              <div class="meta">
-                <strong>{$t('chat.you')}</strong>
-                <span>{shortID($currentSession)}</span>
-              </div>
-              <p>{msg.content}</p>
-              {#if msg.images?.length}
-                <div class="msg-images">
-                  {#each msg.images as image}
-                    <img src={image.dataUrl} alt={image.name} on:load={() => scrollChatToBottom()} />
-                  {/each}
-                </div>
-              {/if}
-            </article>
-          {:else if msg.role === 'assistant'}
-            <article class="msg assistant" class:error={msg.isError}>
-              <div class="meta">
-                <strong>MothX</strong>
-                <span>{msg.isError ? $t('common.failed') : busy && idx === messages.length - 1 ? $t('chat.generating') : $t('common.completed')}</span>
-              </div>
-              {#if msg.content}
-                <div class="markdown" use:codeBlockControls>{@html markdownToHTML(msg.content)}</div>
-              {:else if busy && idx === messages.length - 1}
-                <p class="pending-text">{$t('chat.waitingModel')}</p>
-              {/if}
-              {#if msg.attachments?.length}
-                <div class="response-attachments" aria-label={$t('chat.attachments')}>
-                  {#each msg.attachments as attachment}
-                    {#if safeAttachmentURL(attachment.url)}
-                      <a href={safeAttachmentURL(attachment.url)} target="_blank" rel="noreferrer" class="response-attachment">
-                        {#if attachment.kind === 'image'}
-                          <img class="response-attachment-preview" src={safeAttachmentURL(attachment.url)} alt={attachment.name || attachment.kind} loading="lazy" />
-                        {/if}
-                        <span>{attachment.name || attachment.kind}</span>
-                        <span class="response-attachment-kind">{attachment.kind}</span>
-                      </a>
-                    {:else if attachmentDownloadURL(attachment)}
-                      <a href={attachmentDownloadURL(attachment)} download class="response-attachment">
-                        {#if attachment.mediaType?.startsWith('image/')}
-                          <img class="response-attachment-preview" src={attachmentDownloadURL(attachment)} alt={attachment.name || attachment.kind} loading="lazy" />
-                        {/if}
-                        <span>{attachment.name || attachment.kind}</span>
-                        <span class="response-attachment-kind">{attachment.providerRef}</span>
-                      </a>
-                    {:else}
-                      <span class="response-attachment"><span>{attachment.name || attachment.kind}</span><span class="response-attachment-kind">{attachment.providerRef}</span></span>
-                    {/if}
-                  {/each}
-                </div>
-              {/if}
-            </article>
-          {:else if msg.role === 'plan'}
-            <article class="msg plan-card">
-              <div class="meta">
-                <strong>{$t('chat.plan')}</strong>
-                {#if msg.toolCallId}<span>{shortID(msg.toolCallId)}</span>{/if}
-              </div>
-              <section class="todo-plan">
-                {#if msg.plan.title}
-                  <h3>{msg.plan.title}</h3>
-                {/if}
-                <ol>
-                  {#each msg.plan.steps as step}
-                    <li class:done={step.status === 'done'} class:running={step.status === 'running'} class:failed={step.status === 'failed'}>
-                      <span class="todo-mark" aria-hidden="true"></span>
-                      <span class="todo-title">{step.title}</span>
-                      <em>{planStatusLabel(step.status)}</em>
-                    </li>
-                  {/each}
-                </ol>
-                {#if msg.plan.note}
-                  <p>{msg.plan.note}</p>
-                {/if}
-              </section>
-            </article>
-          {:else if msg.role === 'toolCall'}
-            <article class="msg tool-call">
-              <div class="meta">
-                <strong>{$t('chat.toolCall')}</strong>
-                <span>{msg.toolName}</span>
-              </div>
-              <div class="tool-call-body">
-                <div class="tool-title">
-                  <span class="dot running"></span>
-                  <strong>{msg.callView?.label || msg.toolName}</strong>
-                  {#if msg.callView?.target}
-                    <span class="tool-target">{msg.callView.target}</span>
-                  {/if}
-                  {#if msg.toolCallId}<em>{shortID(msg.toolCallId)}</em>{/if}
-                </div>
-                {#if msg.callView?.details?.length}
-                  <div class="tool-call-tags">
-                    {#each msg.callView.details as item}
-                      <span>{item}</span>
-                    {/each}
-                  </div>
-                {/if}
-                {#if msg.callView?.kind === 'edit' && msg.callView.edits?.length}
-                  <div class="edit-call">
-                    {#each msg.callView.edits as edit}
-                      <section class="edit-block">
-                        <div class="edit-block-head">
-                          <strong>{$t('chat.tool.edit.editNumber', { number: edit.index })}</strong>
-                          <span>{$t('chat.tool.edit.lineChange', { old: edit.oldLines, next: edit.newLines })}</span>
-                        </div>
-                        <div class="edit-columns">
-                          <div class="edit-pane old">
-                            <span>{$t('chat.tool.edit.oldText')}</span>
-                            <pre class:empty={edit.oldText === ''}><code>{@html edit.oldText ? highlightedCodeToHTML(edit.oldText, msg.callView.target) : $t('chat.tool.edit.empty')}</code></pre>
-                          </div>
-                          <div class="edit-pane new">
-                            <span>{$t('chat.tool.edit.newText')}</span>
-                            <pre class:empty={edit.newText === ''}><code>{@html edit.newText ? highlightedCodeToHTML(edit.newText, msg.callView.target) : $t('chat.tool.edit.empty')}</code></pre>
-                          </div>
-                        </div>
-                      </section>
-                    {/each}
-                  </div>
-                {:else if msg.callView?.kind === 'write'}
-                  <div class="write-call">
-                    <div class="write-call-head">
-                      <strong>{$t('chat.tool.write.preview')}</strong>
-                      <span>{$t('chat.tool.write.summary', { lines: msg.callView.lines, chars: msg.callView.chars })}</span>
-                    </div>
-                    <span>{$t('chat.tool.write.content')}</span>
-                    <pre class:empty={msg.callView.content === ''}>{msg.callView.content || $t('chat.tool.edit.empty')}</pre>
-                  </div>
-                {:else if msg.callView?.kind === 'insert'}
-                  <div class="write-call">
-                    <div class="write-call-head">
-                      <strong>{$t('chat.tool.insert.preview')}</strong>
-                      <span>{$t('chat.tool.insert.summary', { lines: msg.callView.lines, chars: msg.callView.chars })}</span>
-                    </div>
-                    <span>{$t('chat.tool.insert.content')}</span>
-                    <pre class:empty={msg.callView.content === ''}>{msg.callView.content || $t('chat.tool.edit.empty')}</pre>
-                  </div>
-                {:else if msg.callView?.kind === 'find'}
-                  <div class="find-call">
-                    <div class="find-row">
-                      <span>{$t('chat.tool.find.pattern')}</span>
-                      <code>{msg.callView.pattern || $t('chat.tool.find.missing')}</code>
-                    </div>
-                    <div class="find-row">
-                      <span>{$t('chat.tool.find.searchPath')}</span>
-                      <code>{msg.callView.path}</code>
-                    </div>
-                    {#if msg.callView.maxDepth !== ''}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.find.depth')}</span>
-                        <code>{msg.callView.maxDepth}</code>
-                      </div>
-                    {/if}
-                    {#if msg.callView.maxResults !== ''}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.find.resultLimit')}</span>
-                      <code>{msg.callView.maxResults}</code>
-                    </div>
-                  {/if}
-                  </div>
-                {:else if msg.callView?.kind === 'browser'}
-                  <div class="browser-call">
-                    <div class="find-row">
-                      <span>{$t('chat.tool.browser.action')}</span>
-                      <code>{msg.callView.action || $t('chat.tool.browser.missing')}</code>
-                    </div>
-                    {#if msg.callView.url}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.browser.url')}</span>
-                        <code>{msg.callView.url}</code>
-                      </div>
-                    {/if}
-                    {#if msg.callView.selector}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.browser.selectorLabel')}</span>
-                        <code>{msg.callView.selector}</code>
-                      </div>
-                    {/if}
-                    {#if msg.callView.value}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.browser.value')}</span>
-                        <code>{msg.callView.value}</code>
-                      </div>
-                    {/if}
-                    {#if msg.callView.expression}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.browser.expression')}</span>
-                        <code>{msg.callView.expression}</code>
-                      </div>
-                    {/if}
-                  </div>
-                {:else if msg.callView?.kind === 'skill-ref'}
-                  <div class="skill-ref-call">
-                    <div class="find-row">
-                      <span>{$t('chat.tool.skillRef.skillLabel')}</span>
-                      <code>{msg.callView.skill || $t('chat.tool.skillRef.missing')}</code>
-                    </div>
-                    <div class="find-row">
-                      <span>{$t('chat.tool.skillRef.refLabel')}</span>
-                      <code>{msg.callView.ref || $t('chat.tool.skillRef.missing')}</code>
-                    </div>
-                  </div>
-                {:else if msg.callView?.kind === 'workflow-lint'}
-                  <div class="workflow-lint-call">
-                    <div class="write-call-head">
-                      <strong>{$t('chat.tool.workflowLint.source')}</strong>
-                      <span>{$t('chat.tool.write.summary', { lines: msg.callView.lines, chars: msg.callView.chars })}</span>
-                    </div>
-                    <pre class:empty={msg.callView.source === ''}>{msg.callView.source || $t('chat.tool.workflowLint.missing')}</pre>
-                  </div>
-                {:else if msg.callView?.kind === 'subagent-task'}
-                  <div class="subagent-call">
-                    <span>{$t('chat.tool.subagent.task')}</span>
-                    <p>{msg.callView.task || msg.callView.target}</p>
-                  </div>
-                {:else if msg.callView?.kind === 'subagent-handle'}
-                  <div class="subagent-call compact">
-                    <div class="find-row">
-                      <span>{$t('chat.tool.subagent.handle')}</span>
-                      <code>{msg.callView.handle || $t('chat.tool.subagent.handleMissing')}</code>
-                    </div>
-                    {#if msg.callView.message}
-                      <div class="find-row">
-                        <span>{$t('chat.tool.subagent.message')}</span>
-                        <code>{msg.callView.message}</code>
-                      </div>
-                    {/if}
-                  </div>
-                {/if}
-                {#if msg.callView?.kind !== 'generic' && msg.arguments}
-                  <details class="tool-raw">
-                    <summary>{$t('chat.argsJson')}</summary>
-                    <pre>{formatArgs(msg.arguments)}</pre>
-                  </details>
-                {:else if msg.arguments}
-                  <pre>{formatArgs(msg.arguments)}</pre>
-                {:else if msg.invalidArguments}
-                  <pre>{msg.invalidArguments}</pre>
-                {/if}
-              </div>
-            </article>
-          {:else if msg.role === 'toolResult'}
-            <article class="msg tool-result">
-              <details on:toggle={(event) => loadToolResultDetail(msg, event)}>
-                <summary>
-                  <span class="dot {msg.isError ? 'error' : 'done'}"></span>
-                  <strong>{msg.toolName}</strong>
-                  <span>{msg.isError ? $t('common.failed') : $t('common.completed')}</span>
-                  <em>{msg.summary}</em>
-                </summary>
-                {#if msg.detailLoading}
-                  <p class="pending-text">{$t('chat.loadingToolResult')}</p>
-                {:else if msg.detailError}
-                  <p class="error-text">{msg.detailError}</p>
-                {:else if msg.detailLoaded}
-                  {#if msg.detail?.kind === 'browser' && msg.detail.browserResult}
-                    <div class="browser-result">
-                      <div class="browser-result-head">
-                        <strong>{msg.detail.browserResult.status}</strong>
-                        {#if msg.detail.browserResult.title}<span>{msg.detail.browserResult.title}</span>{/if}
-                      </div>
-                      {#if msg.detail.browserResult.url}
-                        <code>{msg.detail.browserResult.url}</code>
-                      {/if}
-                      {#if !msg.detail.browserResult.title && !msg.detail.browserResult.url && msg.detail.browserResult.content}
-                        <pre>{msg.detail.browserResult.content}</pre>
-                      {/if}
-                    </div>
-                  {:else if msg.detail?.kind === 'subagent' && msg.detail.subAgentResult}
-                    <div class="subagent-result">
-                      {#if msg.detail.subAgentResult.handle}
-                        <div><span>{$t('chat.tool.subagent.handle')}</span><code>{msg.detail.subAgentResult.handle}</code></div>
-                      {/if}
-                      {#if msg.detail.subAgentResult.status}
-                        <div><span>{$t('chat.tool.subagent.statusLabel')}</span><strong>{msg.detail.subAgentResult.status}</strong></div>
-                      {/if}
-                      {#if msg.detail.subAgentResult.duration}
-                        <div><span>{$t('chat.tool.subagent.duration')}</span><code>{msg.detail.subAgentResult.duration}</code></div>
-                      {/if}
-                      {#if msg.detail.subAgentResult.tool_calls !== undefined}
-                        <div><span>{$t('chat.tool.subagent.toolCalls')}</span><code>{msg.detail.subAgentResult.tool_calls}</code></div>
-                      {/if}
-                      {#if msg.detail.subAgentResult.error}
-                        <p class="error-text">{msg.detail.subAgentResult.error}</p>
-                      {/if}
-                      {#if msg.detail.subAgentResult.result || msg.detail.subAgentResult.last_response || msg.detail.subAgentResult.partial_result}
-                        <pre>{msg.detail.subAgentResult.result || msg.detail.subAgentResult.last_response || msg.detail.subAgentResult.partial_result}</pre>
-                      {/if}
-                    </div>
-                  {:else if msg.detail?.kind === 'skill-ref' && msg.detail.content}
-                    <div class="skill-ref-result">
-                      <div class="markdown" use:codeBlockControls>{@html markdownToHTML(msg.detail.content)}</div>
-                    </div>
-                  {:else if msg.detail?.kind === 'workflow-lint' && msg.detail.workflowLintResult}
-                    <div class="workflow-lint-result">
-                      <div class="workflow-lint-head">
-                        <strong class:failed={!msg.detail.workflowLintResult.valid}>
-                          {msg.detail.workflowLintResult.valid ? $t('chat.tool.workflowLint.valid') : $t('chat.tool.workflowLint.invalid')}
-                        </strong>
-                        {#if msg.detail.workflowLintResult.status}
-                          <span>{msg.detail.workflowLintResult.status}</span>
-                        {/if}
-                      </div>
-                      {#if msg.detail.workflowLintResult.error}
-                        <p class="error-text">{msg.detail.workflowLintResult.error}</p>
-                      {/if}
-                      {#if msg.detail.workflowLintResult.tasks.length}
-                        <section>
-                          <strong>{$t('chat.tool.workflowLint.tasks')}</strong>
-                          <div class="workflow-chip-row">
-                            {#each msg.detail.workflowLintResult.tasks as task}
-                              <code>{task}</code>
-                            {/each}
-                          </div>
-                        </section>
-                      {/if}
-                      {#if msg.detail.workflowLintResult.results.length}
-                        <section>
-                          <strong>{$t('chat.tool.workflowLint.results')}</strong>
-                          <div class="workflow-chip-row">
-                            {#each msg.detail.workflowLintResult.results as result}
-                              <code>{result}</code>
-                            {/each}
-                          </div>
-                        </section>
-                      {/if}
-                    </div>
-                  {:else if msg.detail?.kind === 'bash' && msg.detail.bashResult}
-                    <div class="bash-result">
-                      <div class="bash-meta">
-                        {#if msg.detail.bashResult.runtime}<span>{msg.detail.bashResult.runtime}</span>{/if}
-                        {#if msg.detail.bashResult.cwd}<span>{msg.detail.bashResult.cwd}</span>{/if}
-                        {#if msg.detail.bashResult.exitCode}
-                          <strong class:failed={msg.detail.bashResult.exitCode !== '0'}>exit {msg.detail.bashResult.exitCode}</strong>
-                        {/if}
-                      </div>
-                      {#if msg.detail.bashResult.prefix}
-                        <p class="bash-note">{msg.detail.bashResult.prefix}</p>
-                      {/if}
-                      {#if msg.detail.bashResult.command}
-                        <div class="bash-block">
-                          <span>command</span>
-                          <pre>{msg.detail.bashResult.command}</pre>
-                        </div>
-                      {/if}
-                      {#if msg.detail.bashResult.stdout}
-                        <div class="bash-block">
-                          <span>stdout</span>
-                          <pre class:empty={msg.detail.bashResult.stdout === '(no output)'}>{msg.detail.bashResult.stdout}</pre>
-                        </div>
-                      {/if}
-                      {#if msg.detail.bashResult.stderr}
-                        <div class="bash-block">
-                          <span>stderr</span>
-                          <pre class:empty={msg.detail.bashResult.stderr === '(no output)'}>{msg.detail.bashResult.stderr}</pre>
-                        </div>
-                      {/if}
-                      {#if msg.detail.bashResult.note}
-                        <p class="bash-note">{msg.detail.bashResult.note}</p>
-                      {/if}
-                    </div>
-                  {:else if msg.detail?.kind === 'read' && msg.detail.readLines?.length}
-                    <div class="read-result">
-                      {#each msg.detail.readLines as line}
-                        <div class="code-line">
-                          <span>{line.number}</span>
-                          <code>{line.text}</code>
-                        </div>
-                      {/each}
-                    </div>
-                  {:else if msg.detail?.kind === 'ls' && msg.detail.lsEntries?.length}
-                    <div class="ls-result">
-                      {#each msg.detail.lsEntries as entry}
-                        <div class="ls-entry {entry.type}">
-                          <span>{entry.type === 'dir' ? 'dir' : 'file'}</span>
-                          <strong>{entry.name}</strong>
-                          {#if entry.size}<em>{entry.size}</em>{/if}
-                        </div>
-                      {/each}
-                    </div>
-                  {:else if msg.detail?.kind === 'grep' && msg.detail.grepMatches?.matches?.length}
-                    <div class="grep-result">
-                      {#each msg.detail.grepMatches.matches as match}
-                        <div class="grep-match">
-                          <div><strong>{match.path}</strong><span>:{match.line}</span></div>
-                          <code>{match.text}</code>
-                        </div>
-                      {/each}
-                      {#if msg.detail.grepMatches.note}
-                        <p>{msg.detail.grepMatches.note}</p>
-                      {/if}
-                    </div>
-                  {:else if msg.detail?.content}
-                    <pre>{msg.detail.content}</pre>
-                  {/if}
-                  {#if msg.detail?.images?.length}
-                    <div class="msg-images">
-                      {#each msg.detail.images as image}
-                        <img src={image.dataUrl} alt={image.name} on:load={() => scrollChatToBottom()} />
-                      {/each}
-                    </div>
-                  {/if}
-                {/if}
-              </details>
-            </article>
-          {/if}
-        {/each}
-        {#if hostedItems.length}
-          <div class="hosted-items" aria-label={$t('chat.hostedActivity')} aria-live="polite">
-            {#each hostedItems as item}
-              <span class="hosted-item-status">
-                <span>{item.type || 'hosted'}</span>
-                <span class="hosted-item-state">{item.status || 'updated'}</span>
-              </span>
-            {/each}
-          </div>
-        {/if}
-        {#if sessionEventSummary.visible}
-          <aside class="session-event-strip" title={sessionEventTooltip(sessionEventSummary)}>
-            <span class="dot {sessionRunStateClass(sessionEventSummary.lastRun)}"></span>
-            <strong>{sessionRunLabel(sessionEventSummary.lastRun)}</strong>
-            {#if isCronRun(sessionEventSummary.lastRun)}
-              <span class="event-kind cron">{$t('chat.sessionEvents.cron')}</span>
-              {#if cronRunName(sessionEventSummary.lastRun)}<span>{cronRunName(sessionEventSummary.lastRun)}</span>{/if}
-            {/if}
-            {#if sessionEventSummary.workDir}<span class="path">{compactPath(sessionEventSummary.workDir)}</span>{/if}
-            {#if sessionEventSummary.model}<span>{sessionEventSummary.model}</span>{/if}
-            <span class="metric">{$t('chat.sessionEvents.tokens', { tokens: formatCompactTokens(sessionEventSummary.totalTokens) })}</span>
-            <span class="metric">{$t('chat.sessionEvents.cache', { rate: formatCacheRate(sessionEventSummary) })}</span>
-            {#if sessionEventSummary.capabilityCount > 0}
-              <span>{$t('chat.sessionEvents.capabilities', { count: sessionEventSummary.capabilityCount })}</span>
-            {/if}
-          </aside>
-        {/if}
-      </div>
+      <ChatTranscript
+        {messages}
+        sessionID={$currentSession}
+        {busy}
+        {hostedItems}
+        sessionEventSummary={sessionEventSummary}
+        {codeBlockControls}
+        onImageLoad={scrollChatToBottom}
+        safeURL={safeAttachmentURL}
+        downloadURL={attachmentDownloadURL}
+        onToolToggle={loadToolResultDetail}
+        {sessionEventTooltip}
+        {sessionRunStateClass}
+        {sessionRunLabel}
+      />
     {/if}
   </div>
 
-  <div class="composer">
-    <div class="composer-card">
-      <div class="composer-row">
-      {#if imageUploads.length > 0}
-        <div class="image-preview-row">
-          {#each imageUploads as image, idx}
-            <div class="image-preview">
-              <img src={image.dataUrl} alt={image.name} />
-              <span title={image.name}>{image.name}</span>
-              <em>{formatImageSize(image.size)}</em>
-              <button type="button" aria-label={$t('chat.removeImage')} on:click={() => removeImage(idx)}>×</button>
-            </div>
-          {/each}
-        </div>
-      {/if}
-      <textarea
-        bind:value={prompt}
-        on:keydown={handleKeydown}
-        placeholder={!apiEnabled ? $t('chat.apiDisabled') : busy ? $t('chat.runningPlaceholder') : (isNewSession && !workDir.trim()) ? $t('chat.error.needWorkDir') : $t('chat.messagePlaceholder')}
-        disabled={!apiEnabled}
-        rows="1"
-      ></textarea>
-    </div>
-    <div class="composer-bar">
-      <div class="left">
-        <input
-          bind:this={imageInput}
-          class="file-input"
-          type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
-          multiple
-          on:change={handleImageSelect}
-        />
-        {#if selectedModelSupportsImages}
-          <button
-            type="button"
-            class="icon-btn"
-            disabled={!apiEnabled || busy}
-            title={$t('chat.uploadImage')}
-            aria-label={$t('chat.uploadImage')}
-            on:click={() => imageInput?.click()}
-          >
-            📎
-          </button>
-        {/if}
-        <div bind:this={modelPicker} class="model-picker" aria-label={$t('chat.selectModel')}>
-          <button
-            type="button"
-            class="model-picker-toggle"
-            class:open={showModelPicker}
-            disabled={!apiEnabled || modelOptions.length === 0}
-            aria-expanded={showModelPicker}
-            on:click={() => (showModelPicker = !showModelPicker)}
-          >
-            <span>{currentModelLabel}</span>
-            <span class="model-picker-chevron" aria-hidden="true">⌄</span>
-          </button>
-          {#if showModelPicker}
-            <div class="model-picker-menu" role="listbox">
-              {#each modelOptions as m}
-                <button
-                  type="button"
-                  class:active={$selectedModel === m.id}
-                  role="option"
-                  aria-selected={$selectedModel === m.id}
-                  on:click={() => selectModel(m.id)}
-                >{m.id}</button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-        <div bind:this={runtimeControls} class="runtime-controls" aria-label="Session runtime controls">
-          <button
-            type="button"
-            class:open={showRuntimePanel}
-            class="runtime-toggle"
-            aria-expanded={showRuntimePanel}
-            aria-controls="session-runtime-panel"
-            on:click={() => (showRuntimePanel = !showRuntimePanel)}
-          >
-            <span class="runtime-label">Mode</span>
-            <strong>{runtimeMode}</strong>
-            <span class="runtime-chevron" aria-hidden="true">⌄</span>
-            {#if pendingApprovalCount}<span class="runtime-badge">{pendingApprovalCount}</span>{/if}
-          </button>
-          {#if showRuntimePanel}
-            <section id="session-runtime-panel" class="runtime-panel">
-              <header>
-                <strong>Session runtime</strong>
-                {#if runtimeActiveRun}<span class="dot running"></span><span>{runtimeActiveRun.status}</span>{/if}
-              </header>
-              <p class="runtime-hint">plan is read-only planning, agent requests approval for guarded actions, and yolo runs automatically.</p>
-              <div class="mode-switcher" role="group" aria-label="Agent mode">
-                {#each ['plan', 'agent', 'yolo'] as mode}
-                  <button type="button" class:active={runtimeMode === mode} disabled={runtimeUpdating || busy} on:click={() => setMode(mode)}>{mode}</button>
-                {/each}
-              </div>
-              {#if pendingApprovalCount}
-                <div class="approval-summary"><strong>{pendingApprovalCount} pending approval{pendingApprovalCount === 1 ? '' : 's'}</strong><button type="button" class="ghost sm" on:click={() => (showApprovalCenter = true)}>Review approvals</button></div>
-              {/if}
-            </section>
-          {/if}
-        </div>
-        <div bind:this={skillPicker} class="skill-picker" aria-label="Active skills">
-          <button type="button" class="skill-picker-toggle" disabled={!apiEnabled || busy} on:click={() => (showSkillPicker = !showSkillPicker)} aria-expanded={showSkillPicker}>
-            <span>Skills</span>
-            <strong>{activeSkills.length ? `${activeSkills.length} active` : 'none active'}</strong>
-            <span class="runtime-chevron">⌄</span>
-          </button>
-          {#if showSkillPicker}
-            <div class="skill-picker-menu">
-              <header><strong>Project skills</strong><span>{activeSkills.length} active · {availableSkills.length - activeSkills.length} pending</span></header>
-              {#if availableSkills.length === 0}
-                <p class="skill-picker-empty">No skills found in this project.</p>
-              {:else}
-                {#each availableSkills as skill}
-                  <label class:active={activeSkills.includes(skill.name)}>
-                    <input type="checkbox" checked={activeSkills.includes(skill.name)} disabled={busy} on:change={(event) => toggleSkill(skill.name, event)} />
-                    <span class="skill-name">{skill.name}</span>
-                    <em>{activeSkills.includes(skill.name) ? 'active' : 'pending'}</em>
-                  </label>
-                {/each}
-              {/if}
-            </div>
-          {/if}
-        </div>
-        <div bind:this={toolMenuBtn} class="tool-menu" aria-label={$t('chat.tools')}>
-          <button
-            type="button"
-            class="tool-menu-toggle"
-            class:open={showToolMenu}
-            disabled={!apiEnabled || busy}
-            on:click={() => (showToolMenu = !showToolMenu)}
-            aria-expanded={showToolMenu}
-          >
-            <span class="tool-menu-label">Tools</span>
-            <strong>{activeToolCount}</strong>
-            <span class="runtime-chevron">⌄</span>
-          </button>
-          {#if showToolMenu}
-            <div class="tool-menu-popover">
-              <header><strong>{$t('chat.tools')}</strong><span>{$t('chat.toolHint')}</span></header>
-              {#each availableToolToggles as item}
-                <label class="tool-menu-item" class:active={sessionTools[item.key]} title={$t(`chat.toolToggle.${item.key}`)}>
-                  <input
-                    type="checkbox"
-                    checked={sessionTools[item.key]}
-                    disabled={!apiEnabled || busy}
-                    on:change={(event) => { updateToolOption(item.key, event); }}
-                  />
-                  <span class="tool-item-name">{item.label}</span>
-                  <em>{sessionTools[item.key] ? 'on' : 'off'}</em>
-                </label>
-              {/each}
-            </div>
-          {/if}
-        </div>
-        {#if $currentSession}
-          <button
-            type="button"
-            class="tool-menu-toggle mcp-config-toggle"
-            disabled={!apiEnabled || busy}
-            on:click={() => (showMCPConfig = true)}
-          >
-            <span class="tool-menu-label">MCP</span>
-          </button>
-        {/if}
-        {#if isNewSession}
-          <button
-            type="button"
-            class="workdir-pill"
-            class:has-dir={Boolean(workDir.trim())}
-            disabled={!apiEnabled || busy}
-            on:click={chooseWorkDir}
-            title={workDir || $t('chat.selectWorkDir')}
-          >
-            <span class="workdir-icon">📁</span>
-            <span class="workdir-text">{workDir ? compactWorkDir(workDir) : $t('chat.selectWorkDir')}</span>
-          </button>
-        {/if}
-      </div>
-      <div class="right">
-        {#if busy}
-          <button type="button" class="stop-btn" disabled={stopSubmitting} on:click={stop} title={stopSubmitting ? 'Stopping…' : $t('common.stop')} aria-label={stopSubmitting ? 'Stopping…' : $t('common.stop')}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-          </button>
-        {/if}
-        <button
-          type="button"
-          class="send-btn primary"
-          disabled={busy || (!prompt.trim() && imageUploads.length === 0) || !apiEnabled || (isNewSession && !workDir.trim())}
-          on:click={sendPrompt}
-          title={busy ? $t('chat.sending') : $t('chat.send')}
-          aria-label={busy ? $t('chat.sending') : $t('chat.send')}
-        >
-          {#if busy}
-            <span class="spinner sm"></span>
-          {:else}
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
-          {/if}
-        </button>
-      </div>
-      </div>
-    </div>
-    {#if $currentSession}
-      <div class="composer-session-info">
-        <span class="session-badge">{$t('chat.session')}</span>
-        <span class="session-id">{shortID($currentSession)}</span>
-        {#if activeSessionWorkDir}<span class="session-dir">{activeSessionWorkDir}</span>{/if}
-        <button type="button" class="ghost sm" on:click={resetSession}>{$t('chat.newSession')}</button>
-      </div>
-    {/if}
-  </div>
+  <Composer
+    bind:this={composer}
+    {prompt}
+    {imageUploads}
+    {busy}
+    {apiEnabled}
+    {isNewSession}
+    {workDir}
+    currentSession={$currentSession}
+    {activeSessionWorkDir}
+    {selectedModelSupportsImages}
+    {modelOptions}
+    selectedModel={$selectedModel}
+    {currentModelLabel}
+    {showModelPicker}
+    {runtimeMode}
+    {pendingApprovalCount}
+    {runtimeActiveRun}
+    {showRuntimePanel}
+    {runtimeUpdating}
+    {availableSkills}
+    {activeSkills}
+    {showSkillPicker}
+    {availableToolToggles}
+    {sessionTools}
+    {activeToolCount}
+    {showToolMenu}
+    stopSubmitting={stopSubmitting}
+    onPromptChange={(value) => (prompt = value)}
+    onKeydown={handleKeydown}
+    onSend={sendPrompt}
+    onStop={stop}
+    onImageSelect={handleImageSelect}
+    onRemoveImage={removeImage}
+    onToggleModel={() => (showModelPicker = !showModelPicker)}
+    onSelectModel={selectModel}
+    onSetMode={setMode}
+    onToggleRuntime={() => (showRuntimePanel = !showRuntimePanel)}
+    onReviewApprovals={() => (showApprovalCenter = true)}
+    onToggleSkills={() => (showSkillPicker = !showSkillPicker)}
+    onToggleSkill={toggleSkill}
+    onToggleTools={() => (showToolMenu = !showToolMenu)}
+    onUpdateTool={updateToolOption}
+    onOpenMCP={() => (showMCPConfig = true)}
+    onChooseWorkDir={chooseWorkDir}
+    onResetSession={resetSession}
+    onCloseRuntime={() => (showRuntimePanel = false)}
+    onCloseModelPicker={() => (showModelPicker = false)}
+    onCloseSkillPicker={() => (showSkillPicker = false)}
+    onCloseToolMenu={() => (showToolMenu = false)}
+  />
 </section>
 
 
-{#if showApprovalCenter}
-  <div class="subagent-overlay" role="dialog" aria-modal="true" aria-label="Approval center">
-    <div class="subagent-modal approval-center">
-      <header>
-        <div>
-          <strong>Approval center</strong>
-          <span>{pendingApprovalCount} pending · {approvalHistory.length} recorded for this session</span>
-        </div>
-        <button type="button" class="ghost sm" on:click={() => (showApprovalCenter = false)}>Close</button>
-      </header>
-      <div class="approval-list" aria-live="polite">
-        {#if selectedApproval}
-          <article class="approval-card" aria-labelledby="approval-title-{selectedApproval.approvalId}">
-            <div class="approval-card-head">
-              <div class="approval-title-group">
-                <div class="approval-kicker"><span class="approval-risk {selectedApproval.risk || 'medium'}">{selectedApproval.risk || 'medium'} risk</span><span>{selectedApproval.mode || runtimeMode} mode</span></div>
-                <strong id="approval-title-{selectedApproval.approvalId}">{selectedApproval.summary || selectedApproval.tool?.name}</strong>
-                <p>{selectedApproval.reason || 'This action requires confirmation.'}</p>
-              </div>
-              {#if pendingApprovalCount > 1}
-                <label class="approval-picker">Request
-                  <select aria-label="Select pending approval" value={selectedApprovalID} on:change={(event) => { selectedApprovalID = event.currentTarget.value; activeApproval.set((sessionRuntimeValue?.pendingApprovals || []).find((approval) => approval.approvalId === selectedApprovalID) || null); }}>
-                    {#each sessionRuntimeValue?.pendingApprovals || [] as approval}<option value={approval.approvalId}>{approval.summary || approval.tool?.name}</option>{/each}
-                  </select>
-                </label>
-              {/if}
-            </div>
-            {#if selectedApproval.tool?.name === 'bash'}
-              <div class="approval-bash tool-call-body embedded">
-                <div class="tool-title">
-                  <span class="dot running"></span>
-                  <strong>Bash</strong>
-                  {#if approvalBashWorkDir(selectedApproval)}<span class="tool-target">{approvalBashWorkDir(selectedApproval)}</span>{/if}
-                </div>
-                <div class="bash-block">
-                  <span>command</span>
-                  <pre>{approvalBashCommand(selectedApproval)}</pre>
-                </div>
-              </div>
-            {:else}
-              <div class="approval-tool tool-call-body embedded">
-                <div class="tool-title">
-                  <span class="dot running"></span>
-                  <strong>{approvalToolViewValue.label || selectedApproval.tool?.label || selectedApproval.tool?.name}</strong>
-                  {#if approvalToolViewValue.target}<span class="tool-target">{approvalToolViewValue.target}</span>{/if}
-                </div>
-                {#if approvalToolViewValue.details?.length}
-                  <div class="tool-call-tags">
-                    {#each approvalToolViewValue.details as detail}<span>{detail}</span>{/each}
-                  </div>
-                {/if}
-                {#if approvalToolViewValue.kind === 'edit' && approvalToolViewValue.edits?.length}
-                  <div class="edit-call">
-                    {#each approvalToolViewValue.edits as edit}
-                      <section class="edit-block">
-                        <div class="edit-block-head"><strong>{$t('chat.tool.edit.editNumber', { number: edit.index })}</strong><span>{$t('chat.tool.edit.lineChange', { old: edit.oldLines, next: edit.newLines })}</span></div>
-                        <div class="edit-columns"><div class="edit-pane old"><span>{$t('chat.tool.edit.oldText')}</span><pre class:empty={edit.oldText === ''}><code>{@html edit.oldText ? highlightedCodeToHTML(edit.oldText, approvalToolViewValue.target) : $t('chat.tool.edit.empty')}</code></pre></div><div class="edit-pane new"><span>{$t('chat.tool.edit.newText')}</span><pre class:empty={edit.newText === ''}><code>{@html edit.newText ? highlightedCodeToHTML(edit.newText, approvalToolViewValue.target) : $t('chat.tool.edit.empty')}</code></pre></div></div>
-                      </section>
-                    {/each}
-                  </div>
-                {:else if approvalToolViewValue.kind === 'write'}
-                  <div class="write-call"><div class="write-call-head"><strong>{$t('chat.tool.write.preview')}</strong><span>{$t('chat.tool.write.summary', { lines: approvalToolViewValue.lines, chars: approvalToolViewValue.chars })}</span></div><span>{$t('chat.tool.write.content')}</span><pre class:empty={approvalToolViewValue.content === ''}>{approvalToolViewValue.content || $t('chat.tool.edit.empty')}</pre></div>
-                {:else if approvalToolViewValue.kind === 'insert'}
-                  <div class="write-call"><div class="write-call-head"><strong>{$t('chat.tool.insert.preview')}</strong><span>{$t('chat.tool.insert.summary', { lines: approvalToolViewValue.lines, chars: approvalToolViewValue.chars })}</span></div><span>{$t('chat.tool.insert.content')}</span><pre class:empty={approvalToolViewValue.content === ''}>{approvalToolViewValue.content || $t('chat.tool.edit.empty')}</pre></div>
-                {:else if approvalToolViewValue.kind === 'find'}
-                  <div class="find-call"><div class="find-row"><span>{$t('chat.tool.find.pattern')}</span><code>{approvalToolViewValue.pattern || $t('chat.tool.find.missing')}</code></div><div class="find-row"><span>{$t('chat.tool.find.searchPath')}</span><code>{approvalToolViewValue.path}</code></div></div>
-                {:else if approvalToolViewValue.kind === 'browser'}
-                  <div class="browser-call"><div class="find-row"><span>{$t('chat.tool.browser.action')}</span><code>{approvalToolViewValue.action || $t('chat.tool.browser.missing')}</code></div>{#if approvalToolViewValue.url}<div class="find-row"><span>{$t('chat.tool.browser.url')}</span><code>{approvalToolViewValue.url}</code></div>{/if}{#if approvalToolViewValue.selector}<div class="find-row"><span>{$t('chat.tool.browser.selectorLabel')}</span><code>{approvalToolViewValue.selector}</code></div>{/if}</div>
-                {:else if approvalToolViewValue.kind === 'skill-ref'}
-                  <div class="skill-ref-call"><div class="find-row"><span>{$t('chat.tool.skillRef.skillLabel')}</span><code>{approvalToolViewValue.skill || $t('chat.tool.skillRef.missing')}</code></div><div class="find-row"><span>{$t('chat.tool.skillRef.refLabel')}</span><code>{approvalToolViewValue.ref || $t('chat.tool.skillRef.missing')}</code></div></div>
-                {:else}
-                  <div class="approval-tool-summary"><span>{selectedApproval.tool?.details?.path || selectedApproval.context?.workDir || 'This action requires permission.'}</span></div>
-                {/if}
-              </div>
-            {/if}
-            <div class="approval-actions">
-              <button class="primary" disabled={approvalSubmitting} on:click={() => respondApproval(selectedApproval, 'approve_once')}>Approve once</button>
-              <button class="ghost approval-deny" disabled={approvalSubmitting} on:click={() => respondApproval(selectedApproval, 'deny_once')}>Deny</button>
-              {#if selectedApproval.actions?.includes('remember_command')}<span class="approval-action-divider"></span><button class="ghost sm" disabled={approvalSubmitting} on:click={() => respondApproval(selectedApproval, 'remember_command')}>Always allow command</button><button class="ghost sm" disabled={approvalSubmitting} on:click={() => respondApproval(selectedApproval, 'remember_prefix')}>Always allow prefix</button>{/if}
-              {#if selectedApproval.actions?.includes('allow_edit_path')}<button class="ghost sm" disabled={approvalSubmitting} on:click={() => respondApproval(selectedApproval, 'allow_edit_path')}>Allow this path</button>{/if}
-            </div>
-            <details class="approval-raw"><summary>Request JSON</summary><pre>{JSON.stringify(selectedApproval, null, 2)}</pre></details>
-          </article>
-        {:else}
-          <div class="approval-empty"><strong>No pending approvals</strong><span>New approval requests will appear here.</span></div>
-        {/if}
-        {#if approvalHistory.length}
-          <section class="approval-history" aria-label="Session approval history">
-            <div class="approval-history-head"><h4>Session audit history</h4><span>{approvalHistory.length} decisions</span></div>
-            <div class="approval-history-list">
-              {#each approvalHistory as item}
-                <article class="approval-history-item">
-                  <strong>{item.action === 'deny_once' ? 'Denied' : 'Approved'}</strong>
-                  <span>{item.message || item.action}</span>
-                </article>
-              {/each}
-            </div>
-          </section>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
+<ApprovalCenter
+  open={showApprovalCenter}
+  pendingApprovals={sessionRuntimeValue?.pendingApprovals || []}
+  {selectedApproval}
+  {selectedApprovalID}
+  {approvalHistory}
+  {runtimeMode}
+  submitting={approvalSubmitting}
+  onClose={() => (showApprovalCenter = false)}
+  onSelect={selectApproval}
+  onRespond={respondApproval}
+/>
 
 {#if showMCPConfig && $currentSession}
   <div class="mcp-session-overlay" role="dialog" aria-modal="true" aria-label={$t('chat.mcp.sessionTitle')}>
@@ -2682,141 +1211,14 @@
 
 <DirBrowser bind:open={showBrowser} on:select={onDirSelect} on:close={() => (showBrowser = false)} />
 
-{#if showSubAgentModal}
-  <div class="subagent-overlay" role="dialog" aria-modal="true" aria-label={$t('chat.subagents.history')}>
-    <div class="subagent-modal">
-      <header>
-        <div>
-          <strong>{$t('chat.subagents.history')}</strong>
-          <span>{$t('chat.subagents.subtitle', { count: subAgents.length })}</span>
-        </div>
-        <button type="button" class="ghost sm" on:click={closeSubAgentModal}>{$t('common.close')}</button>
-      </header>
-      <div class="subagent-modal-body">
-        <aside class="subagent-list">
-          {#each subAgents as agent}
-            <button
-              type="button"
-              class:active={agent.id === selectedSubAgentID}
-              on:click={() => selectSubAgent(agent.id)}
-            >
-              <span class="dot {subAgentStateClass(agent)}"></span>
-              <strong>{shortID(agent.id)}</strong>
-              <em>{subAgentStatusLabel(agent.status)}</em>
-              {#if agent.messageCount}<small>{agent.messageCount}</small>{/if}
-            </button>
-          {/each}
-        </aside>
-        <section class="subagent-history">
-          {#if selectedSubAgent?.error}
-            <div class="subagent-error" role="status">
-              <strong>{$t('chat.subagents.error')}</strong>
-              <p>{selectedSubAgent.error}</p>
-            </div>
-          {/if}
-          {#if subAgentModalLoading}
-            <p class="pending-text">{$t('chat.subagents.loading')}</p>
-          {:else if subAgentModalError}
-            <p class="error-text">{subAgentModalError}</p>
-          {:else if subAgentModalMessages.length === 0}
-            <p class="pending-text">{$t('chat.subagents.empty')}</p>
-          {:else}
-            {#each subAgentModalMessages as item}
-              <article class="subagent-msg {item.role}">
-                <div class="meta">
-                  <strong>{item.role === 'assistant' ? 'assistant' : item.role}</strong>
-                  {#if item.toolName}<span>{item.toolName}</span>{/if}
-                </div>
-                {#if item.role === 'assistant'}
-                  <div class="markdown" use:codeBlockControls>{@html markdownToHTML(item.content || '')}</div>
-                {:else if item.role === 'user'}
-                  <p>{item.content}</p>
-                {:else if item.role === 'toolCall'}
-                  <div class="tool-call-body embedded">
-                    <div class="tool-title">
-                      <span class="dot running"></span>
-                      <strong>{item.callView?.label || item.toolName}</strong>
-                      {#if item.callView?.target}<span class="tool-target">{item.callView.target}</span>{/if}
-                    </div>
-                    {#if item.callView?.details?.length}
-                      <div class="tool-call-tags">
-                        {#each item.callView.details as detail}
-                          <span>{detail}</span>
-                        {/each}
-                      </div>
-                    {/if}
-                    {#if item.callView?.kind === 'browser'}
-                      <div class="browser-call">
-                        <div class="find-row">
-                          <span>{$t('chat.tool.browser.action')}</span>
-                          <code>{item.callView.action || $t('chat.tool.browser.missing')}</code>
-                        </div>
-                        {#if item.callView.url}
-                          <div class="find-row">
-                            <span>{$t('chat.tool.browser.url')}</span>
-                            <code>{item.callView.url}</code>
-                          </div>
-                        {/if}
-                        {#if item.callView.selector}
-                          <div class="find-row">
-                            <span>{$t('chat.tool.browser.selectorLabel')}</span>
-                            <code>{item.callView.selector}</code>
-                          </div>
-                        {/if}
-                      </div>
-                    {:else if item.callView?.kind === 'skill-ref'}
-                      <div class="skill-ref-call">
-                        <div class="find-row">
-                          <span>{$t('chat.tool.skillRef.skillLabel')}</span>
-                          <code>{item.callView.skill || $t('chat.tool.skillRef.missing')}</code>
-                        </div>
-                        <div class="find-row">
-                          <span>{$t('chat.tool.skillRef.refLabel')}</span>
-                          <code>{item.callView.ref || $t('chat.tool.skillRef.missing')}</code>
-                        </div>
-                      </div>
-                    {:else if item.callView?.kind === 'workflow-lint'}
-                      <div class="workflow-lint-call">
-                        <div class="write-call-head">
-                          <strong>{$t('chat.tool.workflowLint.source')}</strong>
-                          <span>{$t('chat.tool.write.summary', { lines: item.callView.lines, chars: item.callView.chars })}</span>
-                        </div>
-                        <pre class:empty={item.callView.source === ''}>{item.callView.source || $t('chat.tool.workflowLint.missing')}</pre>
-                      </div>
-                    {:else if item.callView?.kind === 'subagent-task'}
-                      <div class="subagent-call">
-                        <span>{$t('chat.tool.subagent.task')}</span>
-                        <p>{item.callView.task || item.callView.target}</p>
-                      </div>
-                    {:else if item.callView?.kind === 'subagent-handle'}
-                      <div class="subagent-call compact">
-                        <div class="find-row">
-                          <span>{$t('chat.tool.subagent.handle')}</span>
-                          <code>{item.callView.handle || $t('chat.tool.subagent.handleMissing')}</code>
-                        </div>
-                      </div>
-                    {/if}
-                  </div>
-                {:else if item.role === 'toolResult'}
-                  <div class="tool-mini">
-                    <span class="dot {item.isError ? 'error' : 'done'}"></span>
-                    <strong>{item.toolName}</strong>
-                    <span>{item.summary}</span>
-                  </div>
-                {:else if item.role === 'status'}
-                  <div class="tool-mini">
-                    <span class="dot {item.isError ? 'error' : 'done'}"></span>
-                    <strong>{subAgentStatusLabel(item.content)}</strong>
-                    {#if item.summary}<span>{item.summary}</span>{/if}
-                  </div>
-                {:else}
-                  <pre>{item.content || formatArgs(item.arguments)}</pre>
-                {/if}
-              </article>
-            {/each}
-          {/if}
-        </section>
-      </div>
-    </div>
-  </div>
-{/if}
+<SubAgentModal
+  open={showSubAgentModal}
+  agents={subAgents}
+  selectedAgentID={selectedSubAgentID}
+  messages={subAgentModalMessages}
+  loading={subAgentModalLoading}
+  error={subAgentModalError}
+  {codeBlockControls}
+  onClose={closeSubAgentModal}
+  onSelect={selectSubAgent}
+/>

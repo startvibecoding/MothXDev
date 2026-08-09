@@ -53,3 +53,80 @@ export function approvalHistoryFromRunEvents(events = []) {
     .filter((resolution) => resolution?.approvalId)
     .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
 }
+
+// Coordinates the approval center's selection, submission, and runtime cleanup
+// without depending on Svelte stores or component-local state.
+export function createApprovalManager({
+  getCurrentSession,
+  getRuntime,
+  getSelectedID,
+  setSelected,
+  setOpen,
+  setSubmitting,
+  postJSON,
+  recordResolution,
+  applyViewReducer,
+  reduceResolved,
+  setError
+}) {
+  let submitting = false;
+
+  function pendingApprovals() {
+    return getRuntime()?.pendingApprovals || [];
+  }
+
+  function select(approvalID) {
+    const approval = pendingApprovals().find((item) => item?.approvalId === approvalID) || null;
+    setSelected(approval?.approvalId || '', approval);
+    return approval;
+  }
+
+  function syncPending() {
+    const pending = pendingApprovals();
+    const selectedID = getSelectedID();
+    if (pending.length > 0 && !pending.some((item) => item?.approvalId === selectedID)) {
+      select(pending[0].approvalId);
+    } else if (pending.length === 0 && selectedID) {
+      setSelected('', null);
+    }
+  }
+
+  function request(approval) {
+    if (!approval?.approvalId) return;
+    setSelected(approval.approvalId, approval);
+    setOpen(true);
+  }
+
+  function resolved(approval, sessionID = approvalSessionID(approval, getCurrentSession())) {
+    if (!approval?.approvalId || sessionID !== getCurrentSession()) return;
+    if (getSelectedID() === approval.approvalId) setSelected('', null);
+  }
+
+  async function respond(approval, action) {
+    const sessionID = approvalSessionID(approval, getCurrentSession());
+    if (!approval?.approvalId || !sessionID || submitting) return null;
+    submitting = true;
+    setSubmitting(true);
+    try {
+      const result = await postJSON(
+        `/api/sessions/${encodeURIComponent(sessionID)}/approvals/${encodeURIComponent(approval.approvalId)}`,
+        { action }
+      );
+      recordResolution(result, sessionID);
+      applyViewReducer(sessionID, (view) => ({ view: reduceResolved(view, result) }));
+      if (sessionID === getCurrentSession()) {
+        setSelected('', null);
+        setOpen(false);
+      }
+      return result;
+    } catch (error) {
+      setError(error);
+      return null;
+    } finally {
+      submitting = false;
+      setSubmitting(false);
+    }
+  }
+
+  return { request, resolved, respond, select, syncPending };
+}
